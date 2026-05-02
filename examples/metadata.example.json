@@ -1,0 +1,31 @@
+{
+  "hls_url": "master.m3u8",
+  "has_dubbed": true,
+  "is_multi_audio": true,
+  "has_subtitle": true,
+  "qualities": ["1080", "720", "480", "360", "240"],
+  "audio_tracks": [
+    {
+      "name": "دوبله فارسی",
+      "language": "fa",
+      "type": "dubbed",
+      "default": true,
+      "uri": "audio/fa/index.m3u8"
+    },
+    {
+      "name": "English",
+      "language": "en",
+      "type": "original",
+      "default": false,
+      "uri": "audio/en/index.m3u8"
+    }
+  ],
+  "subtitles": [
+    {
+      "name": "Persian Subtitle",
+      "language": "fa",
+      "default": false,
+      "uri": "subtitles/fa.vtt"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+appId: com.media.hlspackager
+productName: HLS Media Packager
+directories:
+  output: release
+  buildResources: build
+files:
+  - "dist/**"
+  - "resources/**"
+  - "package.json"
+  - "!src/**"
+  - "!*.md"
+  - "!electron.vite.config.ts"
+  - "!tsconfig.json"
+asarUnpack:
+  - "resources/bin/**"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  executableName: HLS-Media-Packager
+nsis:
+  artifactName: "${productName}-${version}-setup.${ext}"
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: HLS Media Packager
+npmRebuild: false

@@ -1,0 +1,29 @@
+{
+  "name": "hls-media-packager",
+  "version": "1.0.0",
+  "description": "Windows desktop app for creating HLS VOD packages from local media files.",
+  "main": "dist/main/index.js",
+  "author": "Media Team",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "build:win": "npm run build && electron-builder --win --config electron-builder.yml"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^3.1.0",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11"
+  }
+}
