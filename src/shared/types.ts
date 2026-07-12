@@ -5,13 +5,18 @@ export type QualityKey = "1080" | "720" | "480" | "360" | "240";
 export type PerformanceMode = "fast" | "balanced" | "quality";
 export type EncoderPreference = "auto" | "nvidia" | "intel" | "amd" | "cpu";
 export type AudioMode = "copy-when-possible" | "encode-aac";
+export type VideoPipelineMode = "gpu-scale" | "cpu-scale";
+export type ContentType = "movie" | "series";
 
 export interface VideoInput {
   path: string;
   durationSeconds: number;
+  frameRate: number;
   width: number;
   height: number;
   videoCodec: string;
+  formatBitrateKbps?: number;
+  videoBitrateKbps?: number;
   audioCodec?: string;
   audioStreamCount: number;
   defaultAudioLanguage?: string;
@@ -48,9 +53,16 @@ export interface QualityPreset {
 export interface PackagingJob {
   videoPath: string;
   outputDir: string;
+  movieTitle?: string;
+  contentType?: ContentType;
+  seriesTitle?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
+  episodeTitle?: string;
   qualities: QualityPreset[];
   audioTracks: AudioTrack[];
   subtitles: SubtitleTrack[];
+  allowUpscaleQualities?: boolean;
   segmentDuration: number;
   useHardwareAcceleration: boolean;
   performanceMode: PerformanceMode;
@@ -66,6 +78,7 @@ export interface PackagingProgress {
   step:
     | "validating"
     | "preparing"
+    | "benchmark"
     | "video"
     | "audio"
     | "subtitles"
@@ -87,6 +100,9 @@ export interface PackagingResult {
   masterPlaylistPath?: string;
   metadataPath?: string;
   selectedEncoder?: string;
+  selectedVideoPipeline?: VideoPipelineMode;
+  effectiveSegmentDuration?: number;
+  effectiveOutputFps?: number;
   generatedQualities: string[];
   audioTracks: Array<{
     name: string;
@@ -117,6 +133,11 @@ export interface AppSettings {
   theme: ThemeMode;
   recentVideoPath?: string;
   recentOutputDir?: string;
+  recentContentType?: ContentType;
+  recentSeriesTitle?: string;
+  recentSeasonNumber?: number;
+  recentEpisodeNumber?: number;
+  recentEpisodeTitle?: string;
 }
 
 export interface EncoderCapabilities {

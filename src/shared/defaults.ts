@@ -9,7 +9,7 @@ export const QUALITY_PRESETS: QualityPreset[] = [
 ];
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  segmentDuration: 6,
+  segmentDuration: 7.5,
   useHardwareAcceleration: true,
   performanceMode: "fast",
   encoderPreference: "auto",

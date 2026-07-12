@@ -84,7 +84,10 @@ function registerIpcHandlers(): void {
     const result = await dialog.showOpenDialog({
       properties: ["openFile"],
       filters: [
-        { name: "MP4 Video", extensions: ["mp4"] },
+        {
+          name: "Video files",
+          extensions: ["mp4", "mkv", "mov", "m4v", "avi", "webm", "ts", "m2ts", "mpg", "mpeg"],
+        },
         { name: "All files", extensions: ["*"] },
       ],
     });
@@ -158,10 +161,8 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(IPC_CHANNELS.detectEncoders, async (_event, ffmpegPathOverride?: string) => {
     try {
-      const settings = await settingsStore.load();
       const binaries = resolveBinaryPaths({
-        ffmpegPathOverride: ffmpegPathOverride ?? settings.ffmpegPath,
-        ffprobePathOverride: settings.ffprobePath,
+        ffmpegPathOverride,
       });
       const detection = await hardwareDetector.detectForUi(binaries.ffmpegPath);
       return ok(detection, binaries.warnings);
@@ -172,10 +173,8 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(IPC_CHANNELS.probeVideo, async (_event, videoPath: string, ffprobePathOverride?: string) => {
     try {
-      const settings = await settingsStore.load();
       const binaries = resolveBinaryPaths({
-        ffmpegPathOverride: settings.ffmpegPath,
-        ffprobePathOverride: ffprobePathOverride ?? settings.ffprobePath,
+        ffprobePathOverride,
       });
       const info = await probeVideo(videoPath, binaries.ffprobePath);
       return ok(info, binaries.warnings);
@@ -191,22 +190,14 @@ function registerIpcHandlers(): void {
 
     try {
       packagingRunning = true;
-      const settings = await settingsStore.load();
       const binaries = resolveBinaryPaths({
-        ffmpegPathOverride: job.ffmpegPathOverride ?? settings.ffmpegPath,
-        ffprobePathOverride: job.ffprobePathOverride ?? settings.ffprobePath,
+        ffmpegPathOverride: job.ffmpegPathOverride,
+        ffprobePathOverride: job.ffprobePathOverride,
       });
 
       const result = await packager.package(job, binaries, {
         onProgress: (progress) => sendProgress(IPC_CHANNELS.packagingProgress, progress),
         onLog: (line) => sendProgress(IPC_CHANNELS.packagingLog, line),
-      });
-
-      await settingsStore.save({
-        recentVideoPath: job.videoPath,
-        recentOutputDir: job.outputDir,
-        ffmpegPath: job.ffmpegPathOverride ?? settings.ffmpegPath,
-        ffprobePath: job.ffprobePathOverride ?? settings.ffprobePath,
       });
 
       return ok(result, binaries.warnings);

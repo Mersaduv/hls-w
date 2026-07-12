@@ -6,6 +6,9 @@ interface FFprobeStream {
   codec_name?: string;
   width?: number;
   height?: number;
+  bit_rate?: string;
+  avg_frame_rate?: string;
+  r_frame_rate?: string;
   disposition?: {
     default?: number;
   };
@@ -16,11 +19,39 @@ interface FFprobeStream {
 
 interface FFprobeFormat {
   duration?: string;
+  bit_rate?: string;
 }
 
 interface FFprobeOutput {
   streams?: FFprobeStream[];
   format?: FFprobeFormat;
+}
+
+function parseFrameRate(raw?: string): number {
+  if (!raw) return 0;
+  const cleaned = raw.trim();
+  if (!cleaned) return 0;
+
+  if (cleaned.includes("/")) {
+    const [numRaw, denRaw] = cleaned.split("/", 2);
+    const numerator = Number.parseFloat(numRaw);
+    const denominator = Number.parseFloat(denRaw);
+    if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) {
+      return 0;
+    }
+    const value = numerator / denominator;
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  const value = Number.parseFloat(cleaned);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function parseBitrateKbps(raw?: string): number | undefined {
+  if (!raw) return undefined;
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  return Math.round(value / 1000);
 }
 
 export function probeVideo(videoPath: string, ffprobePath: string): Promise<VideoInput> {
@@ -68,13 +99,22 @@ export function probeVideo(videoPath: string, ffprobePath: string): Promise<Vide
           audioStreams.find((stream) => (stream.disposition?.default ?? 0) === 1) ?? audioStreams[0];
         const defaultAudioLanguage = defaultAudioStream?.tags?.language?.trim().toLowerCase();
         const durationSeconds = Number.parseFloat(parsed.format?.duration ?? "0") || 0;
+        const frameRate =
+          parseFrameRate(videoStream.avg_frame_rate) ||
+          parseFrameRate(videoStream.r_frame_rate) ||
+          0;
+        const videoBitrateKbps = parseBitrateKbps(videoStream.bit_rate);
+        const formatBitrateKbps = parseBitrateKbps(parsed.format?.bit_rate);
 
         resolve({
           path: videoPath,
           durationSeconds,
+          frameRate,
           width: videoStream.width,
           height: videoStream.height,
           videoCodec: videoStream.codec_name ?? "unknown",
+          formatBitrateKbps,
+          videoBitrateKbps,
           audioCodec: audioStreams[0]?.codec_name,
           audioStreamCount: audioStreams.length,
           defaultAudioLanguage: defaultAudioLanguage && defaultAudioLanguage.length > 0 ? defaultAudioLanguage : undefined,

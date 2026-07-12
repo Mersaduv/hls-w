@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { AudioType } from "@shared/types";
+import type { AudioType, ContentType } from "@shared/types";
 
 export interface MasterVideoVariant {
   quality: string;
@@ -78,13 +78,28 @@ export async function writeMasterPlaylist(
 export async function writeMetadataJson(
   outputDir: string,
   payload: {
+    contentType: ContentType;
+    seriesTitle?: string;
+    seasonNumber?: number;
+    episodeNumber?: number;
+    episodeTitle?: string;
     qualities: string[];
     audioTracks: MasterAudioTrack[];
     subtitles: MasterSubtitleTrack[];
   }
 ): Promise<string> {
+  const isSeries = payload.contentType === "series";
   const metadata = {
     hls_url: "master.m3u8",
+    content_type: payload.contentType,
+    series: isSeries
+      ? {
+          title: payload.seriesTitle ?? "",
+          season: payload.seasonNumber ?? 1,
+          episode: payload.episodeNumber ?? 1,
+          episode_title: payload.episodeTitle ?? "",
+        }
+      : undefined,
     has_dubbed: payload.audioTracks.some((track) => track.type === "dubbed"),
     is_multi_audio: payload.audioTracks.length > 1,
     has_subtitle: payload.subtitles.length > 0,

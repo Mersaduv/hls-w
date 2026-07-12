@@ -3,6 +3,7 @@ import { DEFAULT_SETTINGS, QUALITY_BUNDLES, QUALITY_PRESETS } from "@shared/defa
 import type {
   AppSettings,
   AudioTrack,
+  ContentType,
   PackagingJob,
   PackagingProgress,
   PackagingResult,
@@ -30,6 +31,76 @@ function cloneQualityDefaults(): QualityPreset[] {
   return QUALITY_PRESETS.map((item) => ({ ...item }));
 }
 
+function resetJobState(params: {
+  setVideoPath: (v: string) => void;
+  setVideoInfo: (v: VideoInput | null) => void;
+  setPreferredAudioLanguage: (v: string) => void;
+  setAudioTracks: (v: AudioTrack[]) => void;
+  setSubtitles: (v: SubtitleTrack[]) => void;
+  setQualities: (v: QualityPreset[]) => void;
+  setOutputDir: (v: string) => void;
+  setAllowOverwrite: (v: boolean) => void;
+  setContentType: (v: ContentType) => void;
+  setMovieTitle: (v: string) => void;
+  setSeriesTitle: (v: string) => void;
+  setSeasonNumber: (v: number) => void;
+  setEpisodeNumber: (v: number) => void;
+  setEpisodeTitle: (v: string) => void;
+  setValidationErrors: (v: string[]) => void;
+  setWarnings: (v: string[]) => void;
+  setLogs: (v: string[]) => void;
+  setShowLogs: (v: boolean) => void;
+  setShowCommand: (v: boolean) => void;
+  setCurrentCommand: (v: string) => void;
+  setProgress: (v: PackagingProgress) => void;
+  setIsPackaging: (v: boolean) => void;
+  setResult: (v: PackagingResult | null) => void;
+  setMasterPreview: (v: string) => void;
+  setPackagingStartedAt: (v: number | null) => void;
+  setElapsedSeconds: (v: number) => void;
+  setRemainingSeconds: (v: number | null) => void;
+  setMaxProgressSeen: (v: number) => void;
+  setStatusMessage: (v: string) => void;
+}): void {
+  params.setVideoPath("");
+  params.setVideoInfo(null);
+  params.setPreferredAudioLanguage("und");
+  params.setAudioTracks([]);
+  params.setSubtitles([]);
+  params.setQualities(cloneQualityDefaults());
+  params.setOutputDir("");
+  params.setAllowOverwrite(false);
+
+  params.setContentType("movie");
+  params.setMovieTitle("");
+  params.setSeriesTitle("");
+  params.setSeasonNumber(1);
+  params.setEpisodeNumber(1);
+  params.setEpisodeTitle("");
+
+  params.setValidationErrors([]);
+  params.setWarnings([]);
+  params.setLogs([]);
+  params.setShowLogs(false);
+  params.setShowCommand(false);
+  params.setCurrentCommand("");
+
+  params.setProgress({
+    step: "preparing",
+    message: "Idle",
+    percent: 0,
+  });
+
+  params.setIsPackaging(false);
+  params.setResult(null);
+  params.setMasterPreview("");
+  params.setPackagingStartedAt(null);
+  params.setElapsedSeconds(0);
+  params.setRemainingSeconds(null);
+  params.setMaxProgressSeen(0);
+  params.setStatusMessage("Ready.");
+}
+
 function formatClock(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "--:--";
   const seconds = Math.floor(totalSeconds);
@@ -42,17 +113,65 @@ function formatClock(totalSeconds: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+function previewSafeName(value: string, fallback: string): string {
+  const cleaned = value.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_");
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+function videoBaseName(videoPath: string): string {
+  if (!videoPath.trim()) return "movie";
+  const file = basename(videoPath);
+  const dotIndex = file.lastIndexOf(".");
+  if (dotIndex <= 0) return previewSafeName(file, "movie");
+  return previewSafeName(file.slice(0, dotIndex), "movie");
+}
+
+/** Matches packager `chooseSourceBucket`: only this folder under video/sources/ receives the source copy. */
+function sourceCopyTierFolder(sourceHeight: number): string | null {
+  if (!Number.isFinite(sourceHeight) || sourceHeight <= 0) return null;
+  if (sourceHeight >= 1080) return "1080";
+  if (sourceHeight >= 720) return "720";
+  if (sourceHeight >= 480) return "480";
+  if (sourceHeight >= 360) return "360";
+  return "240";
+}
+
 function buildOutputPreview(
   qualities: QualityPreset[],
   audios: AudioTrack[],
-  subtitles: SubtitleTrack[]
+  subtitles: SubtitleTrack[],
+  contentType: ContentType,
+  videoPath: string,
+  movieTitle: string,
+  seriesTitle: string,
+  seasonNumber: number,
+  episodeNumber: number,
+  episodeTitle: string,
+  videoInfo: VideoInput | null
 ): string {
-  const lines: string[] = [
-    "movie_output/",
-    "  master.m3u8",
-    "  metadata.json",
-    "  video/",
-  ];
+  const normalizedSeason = Number.isFinite(seasonNumber) ? Math.max(1, Math.floor(seasonNumber)) : 1;
+  const normalizedEpisode = Number.isFinite(episodeNumber) ? Math.max(1, Math.floor(episodeNumber)) : 1;
+  const movieFolder = previewSafeName(movieTitle.trim() || videoBaseName(videoPath), "movie");
+  const seriesFolder = previewSafeName(seriesTitle || "series", "series");
+  const episodeBase = `episode-${String(normalizedEpisode).padStart(2, "0")}`;
+  const episodeName =
+    contentType === "series" && episodeTitle.trim()
+      ? `${episodeBase}-${previewSafeName(episodeTitle, "episode")}`
+      : episodeBase;
+  const topFolder =
+    contentType === "series"
+      ? `YYYY-MM-DD/${seriesFolder}/season-${String(normalizedSeason).padStart(2, "0")}/${episodeName}/`
+      : `YYYY-MM-DD/${movieFolder}/`;
+
+  const lines: string[] = [topFolder, "  master.m3u8", "  metadata.json", "  video/"];
+
+  const sourceTier = videoInfo ? sourceCopyTierFolder(videoInfo.height) : null;
+  lines.push("    sources/");
+  if (sourceTier) {
+    lines.push(`      ${sourceTier}/  (original file copy only — no empty sibling tiers)`);
+  } else {
+    lines.push("      (one tier only, from source height after probe)");
+  }
 
   for (const quality of qualities.filter((q) => q.enabled).sort((a, b) => b.height - a.height)) {
     lines.push(`    ${quality.key}/`);
@@ -79,6 +198,14 @@ function buildOutputPreview(
   return lines.join("\n");
 }
 
+function requiresUpscale(sourceWidth: number, sourceHeight: number, targetWidth: number, targetHeight: number): boolean {
+  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
+  const widthScale = targetWidth / sourceWidth;
+  const heightScale = targetHeight / sourceHeight;
+  // Matches ffmpeg scale with force_original_aspect_ratio=decrease.
+  return Math.min(widthScale, heightScale) > 1;
+}
+
 export default function App() {
   const [videoPath, setVideoPath] = useState("");
   const [videoInfo, setVideoInfo] = useState<VideoInput | null>(null);
@@ -87,6 +214,12 @@ export default function App() {
   const [subtitles, setSubtitles] = useState<SubtitleTrack[]>([]);
   const [qualities, setQualities] = useState<QualityPreset[]>(cloneQualityDefaults);
   const [outputDir, setOutputDir] = useState("");
+  const [contentType, setContentType] = useState<ContentType>("movie");
+  const [movieTitle, setMovieTitle] = useState("");
+  const [seriesTitle, setSeriesTitle] = useState("");
+  const [seasonNumber, setSeasonNumber] = useState(1);
+  const [episodeNumber, setEpisodeNumber] = useState(1);
+  const [episodeTitle, setEpisodeTitle] = useState("");
 
   const [segmentDuration, setSegmentDuration] = useState(DEFAULT_SETTINGS.segmentDuration);
   const [ffmpegPath, setFfmpegPath] = useState("");
@@ -125,6 +258,40 @@ export default function App() {
   const [maxProgressSeen, setMaxProgressSeen] = useState(0);
 
   const deferredLogs = useDeferredValue(logs);
+
+  function clearAll(): void {
+    resetJobState({
+      setVideoPath,
+      setVideoInfo,
+      setPreferredAudioLanguage,
+      setAudioTracks,
+      setSubtitles,
+      setQualities,
+      setOutputDir,
+      setAllowOverwrite,
+      setContentType,
+      setMovieTitle,
+      setSeriesTitle,
+      setSeasonNumber,
+      setEpisodeNumber,
+      setEpisodeTitle,
+      setValidationErrors,
+      setWarnings,
+      setLogs,
+      setShowLogs,
+      setShowCommand,
+      setCurrentCommand,
+      setProgress,
+      setIsPackaging,
+      setResult,
+      setMasterPreview,
+      setPackagingStartedAt,
+      setElapsedSeconds,
+      setRemainingSeconds,
+      setMaxProgressSeen,
+      setStatusMessage,
+    });
+  }
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -187,30 +354,12 @@ export default function App() {
     });
 
     void (async () => {
-      const settings = await window.electronAPI.loadSettings();
-      if (settings.ok && settings.data) {
-        const loaded: AppSettings = settings.data;
-        setSegmentDuration(loaded.segmentDuration);
-        setUseHardwareAcceleration(loaded.useHardwareAcceleration);
-        setPerformanceMode(loaded.performanceMode);
-        setEncoderPreference(loaded.encoderPreference);
-        setAudioMode(loaded.audioMode);
-        setParallelAudioProcessing(loaded.parallelAudioProcessing);
-        setTheme(loaded.theme);
-        setFfmpegPath(loaded.ffmpegPath ?? "");
-        setFfprobePath(loaded.ffprobePath ?? "");
-        setVideoPath(loaded.recentVideoPath ?? "");
-        setOutputDir(loaded.recentOutputDir ?? "");
-      }
-
       const vlcCheck = await window.electronAPI.detectVlc();
       if (vlcCheck.ok && vlcCheck.data) {
         setVlcAvailable(vlcCheck.data.exists);
       }
 
-      const encoderCheck = await window.electronAPI.detectEncoders(
-        settings.ok && settings.data ? settings.data.ffmpegPath : undefined
-      );
+      const encoderCheck = await window.electronAPI.detectEncoders(undefined);
       if (encoderCheck.ok && encoderCheck.data) {
         const capabilityParts: string[] = [];
         capabilityParts.push(encoderCheck.data.capabilities.nvidiaNvenc ? "NVENC" : "NVENC unavailable");
@@ -229,24 +378,66 @@ export default function App() {
     };
   }, []);
 
-  const outputPreview = buildOutputPreview(qualities, audioTracks, subtitles);
+  const outputPreview = buildOutputPreview(
+    qualities,
+    audioTracks,
+    subtitles,
+    contentType,
+    videoPath,
+    movieTitle,
+    seriesTitle,
+    seasonNumber,
+    episodeNumber,
+    episodeTitle,
+    videoInfo
+  );
 
-  const upscaleWarnings =
-    !videoInfo
-      ? []
-      : qualities
-          .filter(
-            (quality) =>
-              quality.enabled && (quality.width > videoInfo.width || quality.height > videoInfo.height)
-          )
-          .map((quality) => quality.label);
+  useEffect(() => {
+    if (!videoInfo) return;
+    setQualities((prev) =>
+      prev.map((quality) => {
+        const isUpscale = requiresUpscale(videoInfo.width, videoInfo.height, quality.width, quality.height);
+        return isUpscale && quality.enabled ? { ...quality, enabled: false } : quality;
+      })
+    );
+  }, [videoInfo]);
 
   async function pickVideo(): Promise<void> {
     const selected = await window.electronAPI.pickVideo();
     if (!selected) return;
+    // New input video => clear previous job fields.
+    resetJobState({
+      setVideoPath,
+      setVideoInfo,
+      setPreferredAudioLanguage,
+      setAudioTracks,
+      setSubtitles,
+      setQualities,
+      setOutputDir,
+      setAllowOverwrite,
+      setContentType,
+      setMovieTitle,
+      setSeriesTitle,
+      setSeasonNumber,
+      setEpisodeNumber,
+      setEpisodeTitle,
+      setValidationErrors,
+      setWarnings,
+      setLogs,
+      setShowLogs,
+      setShowCommand,
+      setCurrentCommand,
+      setProgress,
+      setIsPackaging,
+      setResult,
+      setMasterPreview,
+      setPackagingStartedAt,
+      setElapsedSeconds,
+      setRemainingSeconds,
+      setMaxProgressSeen,
+      setStatusMessage,
+    });
     setVideoPath(selected);
-    setResult(null);
-    setMasterPreview("");
     setStatusMessage("Analyzing video with ffprobe...");
 
     const probe = await window.electronAPI.probeVideo(selected, ffprobePath || undefined);
@@ -317,7 +508,7 @@ export default function App() {
       id: makeId(),
       filePath: picked,
       name: basename(picked),
-      language: "",
+      language: "fa",
       isDefault: false,
       inputFormat: subtitleFormat(picked),
     };
@@ -365,6 +556,11 @@ export default function App() {
     const errors: string[] = [];
     if (!videoPath.trim()) errors.push("Input video is required.");
     if (!outputDir.trim()) errors.push("Output folder is required.");
+    if (contentType === "series") {
+      if (!seriesTitle.trim()) errors.push("Series title is required in series mode.");
+      if (!Number.isFinite(seasonNumber) || seasonNumber < 1) errors.push("Season number must be at least 1.");
+      if (!Number.isFinite(episodeNumber) || episodeNumber < 1) errors.push("Episode number must be at least 1.");
+    }
     if (!qualities.some((quality) => quality.enabled)) errors.push("Enable at least one quality.");
     if (audioTracks.length === 0) errors.push("Add at least one audio track or use original audio.");
 
@@ -408,13 +604,6 @@ export default function App() {
       return;
     }
 
-    if (upscaleWarnings.length > 0) {
-      const confirmed = window.confirm(
-        `Selected qualities are higher than source resolution: ${upscaleWarnings.join(", ")}.\nContinue anyway?`
-      );
-      if (!confirmed) return;
-    }
-
     setIsPackaging(true);
     setPackagingStartedAt(Date.now());
     setElapsedSeconds(0);
@@ -424,26 +613,19 @@ export default function App() {
     setShowLogs(true);
     setStatusMessage("Starting packaging...");
 
-    await window.electronAPI.saveSettings({
-      ffmpegPath: ffmpegPath.trim() || undefined,
-      ffprobePath: ffprobePath.trim() || undefined,
-      segmentDuration,
-      useHardwareAcceleration,
-      performanceMode,
-      encoderPreference,
-      audioMode,
-      parallelAudioProcessing,
-      theme,
-      recentOutputDir: outputDir,
-      recentVideoPath: videoPath,
-    });
-
     const job: PackagingJob = {
       videoPath,
       outputDir,
+      movieTitle: contentType === "movie" ? movieTitle.trim() || undefined : undefined,
+      contentType,
+      seriesTitle: contentType === "series" ? seriesTitle.trim() : undefined,
+      seasonNumber: contentType === "series" ? Math.max(1, Math.floor(seasonNumber || 1)) : undefined,
+      episodeNumber: contentType === "series" ? Math.max(1, Math.floor(episodeNumber || 1)) : undefined,
+      episodeTitle: contentType === "series" ? episodeTitle.trim() || undefined : undefined,
       qualities,
       audioTracks,
       subtitles,
+      allowUpscaleQualities: false,
       segmentDuration,
       useHardwareAcceleration,
       performanceMode,
@@ -467,7 +649,16 @@ export default function App() {
     setWarnings(response.warnings ?? []);
     setResult(response.data);
     if (response.data.selectedEncoder) {
-      setStatusMessage(`Packaging completed. Encoder used: ${response.data.selectedEncoder}`);
+      const pipelinePart = response.data.selectedVideoPipeline
+        ? ` | Pipeline: ${response.data.selectedVideoPipeline}`
+        : "";
+      const segmentPart = response.data.effectiveSegmentDuration
+        ? ` | Segment: ${response.data.effectiveSegmentDuration}s`
+        : "";
+      const fpsPart = response.data.effectiveOutputFps ? ` | Output FPS: ${response.data.effectiveOutputFps}` : "";
+      setStatusMessage(
+        `Packaging completed. Encoder used: ${response.data.selectedEncoder}${pipelinePart}${segmentPart}${fpsPart}`
+      );
     }
 
     if (response.data.masterPlaylistPath) {
@@ -541,6 +732,17 @@ export default function App() {
         <div className="status-pill">{statusMessage}</div>
       </header>
 
+      <div className="toolbar" style={{ marginBottom: 12 }}>
+        <button
+          className="secondary"
+          onClick={clearAll}
+          disabled={isPackaging}
+          title={isPackaging ? "Cancel packaging first" : "Clear all job fields"}
+        >
+          Clear
+        </button>
+      </div>
+
       {validationErrors.length > 0 && (
         <section className="alert error">
           <strong>Validation errors</strong>
@@ -563,8 +765,8 @@ export default function App() {
         <article className="card">
           <h2>A. Input Video</h2>
           <div className="inline">
-            <input value={videoPath} readOnly placeholder="Select input .mp4 file" />
-            <button onClick={pickVideo}>Select MP4</button>
+            <input value={videoPath} readOnly placeholder="Select input video file" />
+            <button onClick={pickVideo}>Select Video</button>
           </div>
           {videoInfo && (
             <div className="meta-row">
@@ -572,10 +774,85 @@ export default function App() {
               <span>
                 Resolution: {videoInfo.width}x{videoInfo.height}
               </span>
+              <span>Frame rate: {videoInfo.frameRate > 0 ? `${videoInfo.frameRate.toFixed(3)} fps` : "unknown"}</span>
               <span>Video codec: {videoInfo.videoCodec}</span>
+              <span>
+                Source bitrate:{" "}
+                {videoInfo.videoBitrateKbps || videoInfo.formatBitrateKbps
+                  ? `${videoInfo.videoBitrateKbps ?? videoInfo.formatBitrateKbps} kbps`
+                  : "unknown"}
+              </span>
               <span>Audio streams: {videoInfo.audioStreamCount}</span>
             </div>
           )}
+        </article>
+
+        <article className="card">
+          <h2>A1. Content Mode</h2>
+          <div className="inline wrap">
+            <label>
+              Content Type
+              <select value={contentType} onChange={(event) => setContentType(event.target.value as ContentType)}>
+                <option value="movie">Movie / Single Video</option>
+                <option value="series">Series Episode</option>
+              </select>
+            </label>
+            {contentType === "movie" && (
+              <label className="grow">
+                Movie Title (Optional)
+                <input
+                  value={movieTitle}
+                  onChange={(event) => setMovieTitle(event.target.value)}
+                  placeholder="Folder name override"
+                />
+              </label>
+            )}
+            {contentType === "series" && (
+              <>
+                <label className="grow">
+                  Series Title
+                  <input
+                    value={seriesTitle}
+                    onChange={(event) => setSeriesTitle(event.target.value)}
+                    placeholder="My Series Name"
+                  />
+                </label>
+                <label>
+                  Season
+                  <input
+                    type="number"
+                    min={1}
+                    value={seasonNumber}
+                    onChange={(event) => setSeasonNumber(Number.parseInt(event.target.value, 10) || 0)}
+                  />
+                </label>
+                <label>
+                  Episode
+                  <input
+                    type="number"
+                    min={1}
+                    value={episodeNumber}
+                    onChange={(event) => setEpisodeNumber(Number.parseInt(event.target.value, 10) || 0)}
+                  />
+                </label>
+              </>
+            )}
+          </div>
+          {contentType === "series" && (
+            <div className="inline wrap">
+              <label className="grow">
+                Episode Title (Optional)
+                <input
+                  value={episodeTitle}
+                  onChange={(event) => setEpisodeTitle(event.target.value)}
+                  placeholder="Pilot"
+                />
+              </label>
+            </div>
+          )}
+          <p className="muted">
+            Series mode creates folders automatically as: <strong>date / series / season / episode</strong>.
+          </p>
         </article>
 
         <article className="card">
@@ -738,34 +1015,45 @@ export default function App() {
               {qualities
                 .slice()
                 .sort((a, b) => b.height - a.height)
-                .map((quality) => (
-                  <tr key={quality.key}>
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={quality.enabled}
-                        onChange={(event) => updateQuality(quality.key, { enabled: event.target.checked })}
-                      />
-                    </td>
-                    <td>{quality.label}</td>
-                    <td>
-                      {quality.width}x{quality.height}
-                    </td>
-                    <td>
-                      <input
-                        type="number"
-                        min={100}
-                        step={50}
-                        value={quality.bitrateKbps}
-                        onChange={(event) =>
-                          updateQuality(quality.key, { bitrateKbps: Number.parseInt(event.target.value, 10) || 0 })
-                        }
-                      />
-                    </td>
-                  </tr>
-                ))}
+                .map((quality) => {
+                  const disabledBySource =
+                    !!videoInfo &&
+                    requiresUpscale(videoInfo.width, videoInfo.height, quality.width, quality.height);
+                  return (
+                    <tr key={quality.key}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={quality.enabled}
+                          disabled={disabledBySource}
+                          onChange={(event) => updateQuality(quality.key, { enabled: event.target.checked })}
+                        />
+                      </td>
+                      <td>{quality.label}</td>
+                      <td>
+                        {quality.width}x{quality.height}
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min={100}
+                          step={50}
+                          value={quality.bitrateKbps}
+                          onChange={(event) =>
+                            updateQuality(quality.key, { bitrateKbps: Number.parseInt(event.target.value, 10) || 0 })
+                          }
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
             </tbody>
           </table>
+          {videoInfo && (
+            <p className="muted">
+              Qualities above source resolution ({videoInfo.width}x{videoInfo.height}) are disabled automatically.
+            </p>
+          )}
         </article>
 
         <article className="card">
@@ -774,14 +1062,7 @@ export default function App() {
             <input value={outputDir} readOnly placeholder="Select output folder" />
             <button onClick={pickOutputFolder}>Select Folder</button>
           </div>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={allowOverwrite}
-              onChange={(event) => setAllowOverwrite(event.target.checked)}
-            />
-            Allow overwrite if output folder is not empty
-          </label>
+          <p className="muted">Final output folder is auto-created inside selected base directory.</p>
           <pre className="tree">{outputPreview}</pre>
         </article>
 
@@ -937,8 +1218,9 @@ export default function App() {
               <input
                 type="number"
                 min={1}
+                step={0.5}
                 value={segmentDuration}
-                onChange={(event) => setSegmentDuration(Number.parseInt(event.target.value, 10) || 0)}
+                onChange={(event) => setSegmentDuration(Number.parseFloat(event.target.value) || 0)}
               />
             </label>
             <label className="toggle">

@@ -51,8 +51,9 @@ function isAvailable(key: SelectedEncoderKey, capabilities: EncoderCapabilities)
 function pickFastestAvailable(capabilities: EncoderCapabilities, useHardwareAcceleration: boolean): SelectedEncoder {
   if (useHardwareAcceleration) {
     if (capabilities.nvidiaNvenc) return ENCODER_CONFIG.nvidia;
-    if (capabilities.intelQsv) return ENCODER_CONFIG.intel;
     if (capabilities.amdAmf) return ENCODER_CONFIG.amd;
+    // Prefer discrete AMD AMF over Intel QSV when both are present.
+    if (capabilities.intelQsv) return ENCODER_CONFIG.intel;
   }
   return ENCODER_CONFIG.cpu;
 }

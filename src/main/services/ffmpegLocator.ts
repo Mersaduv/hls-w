@@ -61,6 +61,19 @@ function resolveFromPath(binaryName: "ffmpeg" | "ffprobe"): string | undefined {
   return lines[0];
 }
 
+function ffmpegSupportsEncoder(ffmpegPath: string, encoderToken: string): boolean {
+  try {
+    const result = spawnSync(ffmpegPath, ["-hide_banner", "-encoders"], {
+      windowsHide: true,
+      encoding: "utf-8",
+    });
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
+    return output.includes(encoderToken.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 export function resolveBinaryPaths(options: ResolveBinaryOptions = {}): BinaryPaths {
   const warnings: string[] = [];
   const ffmpegCandidates = candidateBinaryPaths("ffmpeg", options.ffmpegPathOverride);
@@ -69,12 +82,31 @@ export function resolveBinaryPaths(options: ResolveBinaryOptions = {}): BinaryPa
   let ffmpegPath = firstExisting(ffmpegCandidates);
   let ffprobePath = firstExisting(ffprobeCandidates);
 
+  const ffmpegFromPath = resolveFromPath("ffmpeg");
+  const ffprobeFromPath = resolveFromPath("ffprobe");
+
   if (!ffmpegPath) {
-    ffmpegPath = resolveFromPath("ffmpeg");
+    ffmpegPath = ffmpegFromPath;
   }
 
   if (!ffprobePath) {
-    ffprobePath = resolveFromPath("ffprobe");
+    ffprobePath = ffprobeFromPath;
+  }
+
+  // If we're not using an explicit override, prefer a PATH ffmpeg that supports NVENC when available.
+  const usingOverride = Boolean(cleanPath(options.ffmpegPathOverride));
+  if (!usingOverride && ffmpegPath && ffmpegFromPath && ffmpegPath !== ffmpegFromPath) {
+    const selectedHasNvenc = ffmpegSupportsEncoder(ffmpegPath, "h264_nvenc");
+    const pathHasNvenc = ffmpegSupportsEncoder(ffmpegFromPath, "h264_nvenc");
+    if (!selectedHasNvenc && pathHasNvenc) {
+      warnings.push(
+        `Selected ffmpeg at "${ffmpegPath}" does not include NVENC encoders. Using PATH ffmpeg at "${ffmpegFromPath}" to enable NVIDIA GPU encoding.`
+      );
+      ffmpegPath = ffmpegFromPath;
+      if (ffprobeFromPath) {
+        ffprobePath = ffprobeFromPath ?? ffprobePath;
+      }
+    }
   }
 
   if (!ffmpegPath || !ffprobePath) {

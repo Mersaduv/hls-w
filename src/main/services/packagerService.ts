@@ -3,13 +3,17 @@ import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import type {
   AudioTrack,
+  ContentType,
+  EncoderPreference,
+  VideoInput,
   PackagingJob,
   PackagingProgress,
   PackagingResult,
+  PerformanceMode,
   QualityPreset,
 } from "@shared/types";
 import { parseProgressSeconds } from "@main/utils/ffmpegParsers";
-import { toSafeLanguageCode } from "@main/utils/stringUtils";
+import { sanitizeFolderName, toSafeLanguageCode } from "@main/utils/stringUtils";
 import { probePrimaryAudioCodec, probeVideo } from "@main/services/ffprobeService";
 import {
   MasterAudioTrack,
@@ -21,6 +25,7 @@ import {
 import { prepareSubtitles } from "@main/services/subtitleService";
 import { HardwareEncoderDetector, type SelectedEncoder } from "@main/services/hardwareEncoderDetector";
 import { FFmpegCommandBuilder, type VideoOutputVariant } from "@main/services/ffmpegCommandBuilder";
+import { VideoPipelineBenchmarkService } from "@main/services/videoPipelineBenchmarkService";
 
 interface BinaryPaths {
   ffmpegPath: string;
@@ -47,6 +52,10 @@ interface AudioEncodePlan {
   inputPath: string;
   mapSelector: string;
   sourceCodec: string | null;
+}
+
+function isDiscreteHardwareEncoder(key: SelectedEncoder["key"]): boolean {
+  return key === "nvidia" || key === "amd";
 }
 
 function quoteArg(arg: string): string {
@@ -88,8 +97,39 @@ function looksLikeEncoderFailure(message: string): boolean {
     text.includes("device failed") ||
     text.includes("qsv") ||
     text.includes("nvenc") ||
-    text.includes("amf")
+    text.includes("amf") ||
+    // decode/hwaccel failure can bubble up as "no packets / nothing written"
+    text.includes("nothing was written into output file") ||
+    text.includes("received no packets") ||
+    text.includes("nothing was written into output file, because") ||
+    text.includes("conversion failed")
   );
+}
+
+function qualityRequiresUpscale(
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number
+): boolean {
+  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
+  const widthScale = targetWidth / sourceWidth;
+  const heightScale = targetHeight / sourceHeight;
+  return Math.min(widthScale, heightScale) > 1;
+}
+
+function chooseSourceBucket(height: number): "1080" | "720" | "480" | "360" | "240" {
+  if (!Number.isFinite(height) || height <= 0) return "240";
+  if (height >= 1080) return "1080";
+  if (height >= 720) return "720";
+  if (height >= 480) return "480";
+  if (height >= 360) return "360";
+  return "240";
+}
+
+function safeFileBaseName(value: string): string {
+  const cleaned = sanitizeFolderName(value);
+  return cleaned.length > 0 ? cleaned : "source";
 }
 
 export class HlsPackagerService {
@@ -98,6 +138,7 @@ export class HlsPackagerService {
   private canceled = false;
   private readonly hardwareDetector = new HardwareEncoderDetector();
   private readonly commandBuilder = new FFmpegCommandBuilder();
+  private readonly pipelineBenchmarker = new VideoPipelineBenchmarkService();
 
   cancel(): void {
     this.canceled = true;
@@ -112,12 +153,16 @@ export class HlsPackagerService {
     const onProgress = callbacks.onProgress;
     const onLog = callbacks.onLog;
 
-    const enabledQualities = job.qualities
+    const requestedEnabledQualities = job.qualities
       .filter((quality) => quality.enabled)
       .sort((a, b) => b.height - a.height);
     const audioTracks = ensureSingleDefaultAudio(job.audioTracks);
-
-    this.validateJob(job, enabledQualities, audioTracks);
+    this.validateJob(job, requestedEnabledQualities, audioTracks);
+    const resolvedOutputDir = await this.resolveRunOutputDirectory(job);
+    const runtimeJob: PackagingJob = {
+      ...job,
+      outputDir: resolvedOutputDir,
+    };
 
     onProgress({
       step: "validating",
@@ -133,6 +178,34 @@ export class HlsPackagerService {
     });
     let selectedEncoder = selectedEncoderResult.selected;
     warnings.push(...selectedEncoderResult.warnings);
+    const forceNvidiaVideoEncoding = runtimeJob.useHardwareAcceleration && capabilities.nvidiaNvenc;
+    if (forceNvidiaVideoEncoding && selectedEncoder.key !== "nvidia") {
+      selectedEncoder = {
+        key: "nvidia",
+        ffmpegEncoder: "h264_nvenc",
+        label: "NVIDIA NVENC",
+        isHardware: true,
+      };
+      warnings.push("NVIDIA NVENC is available, so video encoding is forced to NVIDIA (audio/subtitles remain CPU).");
+    }
+
+    // If a discrete GPU encoder exists, avoid Intel iGPU auto-selection.
+    if (
+      job.useHardwareAcceleration &&
+      selectedEncoder.key === "intel" &&
+      (capabilities.nvidiaNvenc || capabilities.amdAmf)
+    ) {
+      const preferredDiscrete: EncoderPreference = capabilities.nvidiaNvenc ? "nvidia" : "amd";
+      const discretePick = this.hardwareDetector.selectEncoder({
+        capabilities,
+        encoderPreference: preferredDiscrete,
+        useHardwareAcceleration: true,
+      });
+      selectedEncoder = discretePick.selected;
+      warnings.push(
+        `Intel QSV was skipped because a discrete GPU encoder is available. Using ${selectedEncoder.label}.`
+      );
+    }
 
     if (selectedEncoder.key === "cpu") {
       warnings.push(
@@ -142,16 +215,86 @@ export class HlsPackagerService {
 
     onProgress({
       step: "validating",
-      message: `Selected encoder: ${selectedEncoder.label} (${selectedEncoder.ffmpegEncoder})`,
+      message: `Selected encoder: ${selectedEncoder.label} (${selectedEncoder.ffmpegEncoder}) | ffmpeg: ${path.basename(
+        binaries.ffmpegPath
+      )} (${binaries.ffmpegPath})`,
       percent: 4,
     });
 
-    const videoInfo = await probeVideo(job.videoPath, binaries.ffprobePath);
+    const videoInfo = await probeVideo(runtimeJob.videoPath, binaries.ffprobePath);
     if (!videoInfo.audioStreamCount && audioTracks.some((track) => track.source === "video-original")) {
       throw new Error("Input video has no audio stream to extract.");
     }
 
-    await this.prepareOutput(job.outputDir, job.allowOverwrite);
+    const sourceVideoBitrateKbps = await this.estimateSourceVideoBitrateKbps(videoInfo, runtimeJob.videoPath);
+    const bitrateAdjusted = this.adjustBitrateLadderForSource(
+      requestedEnabledQualities,
+      sourceVideoBitrateKbps,
+      videoInfo.width,
+      videoInfo.height
+    );
+    warnings.push(...bitrateAdjusted.warnings);
+
+    const qualityOptimization = this.optimizeQualitiesForSpeed(
+      bitrateAdjusted.qualities,
+      videoInfo.width,
+      videoInfo.height,
+      runtimeJob.performanceMode,
+      runtimeJob.allowUpscaleQualities === true
+    );
+    const enabledQualities = qualityOptimization.qualities;
+    warnings.push(...qualityOptimization.warnings);
+    if (enabledQualities.length === 0) {
+      throw new Error("No quality remains after optimization. Enable at least one valid quality.");
+    }
+
+    const effectiveSegmentDuration = this.resolveEffectiveSegmentDuration(
+      runtimeJob.segmentDuration,
+      runtimeJob.performanceMode
+    );
+    if (effectiveSegmentDuration !== runtimeJob.segmentDuration) {
+      warnings.push(
+        `Fast mode uses a minimum segment duration of 6s for better throughput (requested ${runtimeJob.segmentDuration}s, applied ${effectiveSegmentDuration}s).`
+      );
+    }
+
+    const effectiveOutputFps = this.resolveEffectiveOutputFps(videoInfo.frameRate, runtimeJob.performanceMode);
+    if (
+      effectiveOutputFps !== undefined &&
+      Number.isFinite(videoInfo.frameRate) &&
+      videoInfo.frameRate > effectiveOutputFps
+    ) {
+      warnings.push(
+        `Output frame rate capped from ${videoInfo.frameRate.toFixed(3)}fps to ${effectiveOutputFps}fps to optimize output size.`
+      );
+    }
+
+    let selectedPipelineMode: "gpu-scale" | "cpu-scale" = "cpu-scale";
+    if (runtimeJob.useHardwareAcceleration && selectedEncoder.key !== "cpu") {
+      onProgress({
+        step: "benchmark",
+        message: "Benchmarking video pipelines for best speed...",
+        percent: 6,
+      });
+      const benchmark = await this.pipelineBenchmarker.selectBestPipeline({
+        ffmpegPath: binaries.ffmpegPath,
+        inputPath: runtimeJob.videoPath,
+        qualities: enabledQualities,
+        segmentDuration: effectiveSegmentDuration,
+        mode: runtimeJob.performanceMode,
+        encoder: selectedEncoder,
+        useHardwareAcceleration: runtimeJob.useHardwareAcceleration,
+        sourceDurationSeconds: videoInfo.durationSeconds,
+        sourceFps: videoInfo.frameRate,
+        outputFps: effectiveOutputFps,
+        onLog,
+      });
+      selectedPipelineMode = benchmark.pipelineMode;
+      warnings.push(...benchmark.warnings);
+      onLog(`[benchmark] selected pipeline: ${selectedPipelineMode}`);
+    }
+
+    await this.prepareOutput(runtimeJob.outputDir, runtimeJob.allowOverwrite);
 
     onProgress({
       step: "preparing",
@@ -159,21 +302,41 @@ export class HlsPackagerService {
       percent: 7,
     });
 
-    await this.prepareVideoDirectories(job.outputDir, enabledQualities);
-    const audioPlans = await this.prepareAudioPlans(job, audioTracks, binaries.ffprobePath);
+    await this.prepareVideoDirectories(runtimeJob.outputDir, enabledQualities);
+    await this.prepareVideoSources(runtimeJob.outputDir, runtimeJob.videoPath, videoInfo.height, onProgress);
+    const audioPlans = await this.prepareAudioPlans(runtimeJob, audioTracks, binaries.ffprobePath);
 
     const videoVariants: MasterVideoVariant[] = [];
     const masterAudioTracks: MasterAudioTrack[] = [];
 
     let videoCommandInput = this.commandBuilder.buildVideoCommand({
-      inputPath: job.videoPath,
-      outputDir: job.outputDir,
+      inputPath: runtimeJob.videoPath,
+      outputDir: runtimeJob.outputDir,
       qualities: enabledQualities,
-      segmentDuration: job.segmentDuration,
-      mode: job.performanceMode,
+      segmentDuration: effectiveSegmentDuration,
+      mode: runtimeJob.performanceMode,
       encoder: selectedEncoder,
-      useHardwareAcceleration: job.useHardwareAcceleration,
+      useHardwareAcceleration: runtimeJob.useHardwareAcceleration,
+      pipelineMode: selectedPipelineMode,
+      sourceFps: videoInfo.frameRate,
+      outputFps: effectiveOutputFps,
     });
+
+    const shouldParallelAudioWithVideo = audioPlans.length > 0 && selectedEncoder.key !== "cpu";
+    const audioEncodingPromise: Promise<void> | null = shouldParallelAudioWithVideo
+      ? this.processAudioTracks({
+          plans: audioPlans,
+          binaries,
+          durationSeconds: videoInfo.durationSeconds,
+          job: runtimeJob,
+          effectiveSegmentDuration,
+          onProgress,
+          onLog,
+          // Keep audio progress stable while video is still running.
+          progressStartPercent: 70,
+          progressEndPercent: 70,
+        })
+      : null;
 
     try {
       await this.runFfmpeg({
@@ -190,36 +353,183 @@ export class HlsPackagerService {
     } catch (error) {
       const failureMessage = error instanceof Error ? error.message : String(error);
       if (selectedEncoder.key !== "cpu" && looksLikeEncoderFailure(failureMessage)) {
-        warnings.push(
-          `${selectedEncoder.label} failed during encoding. Falling back to CPU libx264 for reliability.`
-        );
-        selectedEncoder = {
-          key: "cpu",
-          ffmpegEncoder: "libx264",
-          label: "CPU libx264",
-          isHardware: false,
-        };
-        videoCommandInput = this.commandBuilder.buildVideoCommand({
-          inputPath: job.videoPath,
-          outputDir: job.outputDir,
-          qualities: enabledQualities,
-          segmentDuration: job.segmentDuration,
-          mode: job.performanceMode,
-          encoder: selectedEncoder,
-          useHardwareAcceleration: false,
-        });
-        await this.runFfmpeg({
-          binaryPath: binaries.ffmpegPath,
-          args: videoCommandInput.args,
-          durationSeconds: videoInfo.durationSeconds,
-          step: "video",
-          message: "Encoding video ladder with CPU fallback (libx264)",
-          startPercent: 8,
-          endPercent: 70,
-          onProgress,
-          onLog,
-        });
+        let recoveredWithSameGpuEncoder = false;
+
+        // First recovery path: keep the same GPU encoder, but switch to software decode / CPU scaling.
+        // This is more compatible with tricky sources (e.g. some 10-bit HEVC inputs) while still using discrete GPU encode.
+        if (runtimeJob.useHardwareAcceleration) {
+          warnings.push(
+            `${selectedEncoder.label} failed with hardware decode path. Retrying ${selectedEncoder.label} with software decode for compatibility...`
+          );
+          videoCommandInput = this.commandBuilder.buildVideoCommand({
+            inputPath: runtimeJob.videoPath,
+            outputDir: runtimeJob.outputDir,
+            qualities: enabledQualities,
+            segmentDuration: effectiveSegmentDuration,
+            mode: runtimeJob.performanceMode,
+            encoder: selectedEncoder,
+            useHardwareAcceleration: false,
+            pipelineMode: "cpu-scale",
+            sourceFps: videoInfo.frameRate,
+            outputFps: effectiveOutputFps,
+          });
+          try {
+            await this.runFfmpeg({
+              binaryPath: binaries.ffmpegPath,
+              args: videoCommandInput.args,
+              durationSeconds: videoInfo.durationSeconds,
+              step: "video",
+              message: `Encoding video ladder with ${selectedEncoder.label} (software decode fallback)`,
+              startPercent: 8,
+              endPercent: 70,
+              onProgress,
+              onLog,
+            });
+            recoveredWithSameGpuEncoder = true;
+          } catch (sameGpuRetryError) {
+            const sameGpuFailure =
+              sameGpuRetryError instanceof Error ? sameGpuRetryError.message : String(sameGpuRetryError);
+            warnings.push(
+              `${selectedEncoder.label} software-decode retry failed: ${sameGpuFailure}. Trying other discrete GPU encoder...`
+            );
+          }
+        }
+
+        if (recoveredWithSameGpuEncoder) {
+          // keep current selectedEncoder and continue packaging
+        } else {
+        if (forceNvidiaVideoEncoding) {
+          this.cancel();
+          if (audioEncodingPromise) {
+            try {
+              await audioEncodingPromise;
+            } catch {
+              // expected if canceled
+            }
+          }
+          throw new Error(
+            `NVIDIA NVENC is required for video encoding but failed on this input. ` +
+              `CPU/QSV/AMD fallback is disabled by policy. Check NVIDIA driver, ffmpeg NVENC build, and source compatibility.`
+          );
+        }
+
+        const hardwareRetryOrder: EncoderPreference[] =
+          selectedEncoder.key === "nvidia"
+            ? ["amd"]
+            : selectedEncoder.key === "amd"
+              ? ["nvidia"]
+              : capabilities.nvidiaNvenc
+                ? ["nvidia", "amd"]
+                : ["amd", "nvidia"];
+
+        let videoRetrySucceeded = false;
+        let lastFailureMessage = failureMessage;
+
+        // Retry other HW encoders first to keep GPU encoding when possible.
+        for (const pref of hardwareRetryOrder) {
+          const candidate = this.hardwareDetector.selectEncoder({
+            capabilities,
+            encoderPreference: pref,
+            useHardwareAcceleration: true,
+          });
+
+          if (
+            candidate.selected.key === selectedEncoder.key ||
+            candidate.selected.key === "cpu" ||
+            !isDiscreteHardwareEncoder(candidate.selected.key)
+          ) {
+            continue;
+          }
+
+          warnings.push(
+            `${selectedEncoder.label} failed during encoding. Retrying with ${candidate.selected.label}...`
+          );
+
+          selectedEncoder = candidate.selected;
+          const pipelineMode: "gpu-scale" | "cpu-scale" =
+            selectedEncoder.key === "nvidia" ? selectedPipelineMode : "cpu-scale";
+
+          videoCommandInput = this.commandBuilder.buildVideoCommand({
+            inputPath: runtimeJob.videoPath,
+            outputDir: runtimeJob.outputDir,
+            qualities: enabledQualities,
+            segmentDuration: effectiveSegmentDuration,
+            mode: runtimeJob.performanceMode,
+            encoder: selectedEncoder,
+            useHardwareAcceleration: true,
+            pipelineMode,
+            sourceFps: videoInfo.frameRate,
+            outputFps: effectiveOutputFps,
+          });
+
+          try {
+            await this.runFfmpeg({
+              binaryPath: binaries.ffmpegPath,
+              args: videoCommandInput.args,
+              durationSeconds: videoInfo.durationSeconds,
+              step: "video",
+              message: `Encoding video ladder with ${selectedEncoder.label}`,
+              startPercent: 8,
+              endPercent: 70,
+              onProgress,
+              onLog,
+            });
+            videoRetrySucceeded = true;
+            break;
+          } catch (retryError) {
+            lastFailureMessage = retryError instanceof Error ? retryError.message : String(retryError);
+            continue;
+          }
+        }
+
+        if (!videoRetrySucceeded) {
+          warnings.push(
+            `All GPU encoder retries failed (${lastFailureMessage}). Falling back to CPU libx264 for reliability.`
+          );
+
+          selectedEncoder = {
+            key: "cpu",
+            ffmpegEncoder: "libx264",
+            label: "CPU libx264",
+            isHardware: false,
+          };
+
+          videoCommandInput = this.commandBuilder.buildVideoCommand({
+            inputPath: runtimeJob.videoPath,
+            outputDir: runtimeJob.outputDir,
+            qualities: enabledQualities,
+            segmentDuration: effectiveSegmentDuration,
+            mode: runtimeJob.performanceMode,
+            encoder: selectedEncoder,
+            useHardwareAcceleration: false,
+            pipelineMode: "cpu-scale",
+            sourceFps: videoInfo.frameRate,
+            outputFps: effectiveOutputFps,
+          });
+
+          await this.runFfmpeg({
+            binaryPath: binaries.ffmpegPath,
+            args: videoCommandInput.args,
+            durationSeconds: videoInfo.durationSeconds,
+            step: "video",
+            message: "Encoding video ladder with CPU fallback (libx264)",
+            startPercent: 8,
+            endPercent: 70,
+            onProgress,
+            onLog,
+          });
+        }
+      }
       } else {
+        // Ensure any parallel audio encoding is stopped too.
+        this.cancel();
+        if (audioEncodingPromise) {
+          try {
+            await audioEncodingPromise;
+          } catch {
+            // Expected once canceled.
+          }
+        }
         throw error;
       }
     }
@@ -228,12 +538,15 @@ export class HlsPackagerService {
       videoVariants.push(this.toMasterVariant(variant));
     }
 
-    if (audioPlans.length > 0) {
+    if (audioEncodingPromise) {
+      await audioEncodingPromise;
+    } else if (audioPlans.length > 0) {
       await this.processAudioTracks({
         plans: audioPlans,
         binaries,
         durationSeconds: videoInfo.durationSeconds,
-        job,
+        job: runtimeJob,
+        effectiveSegmentDuration,
         onProgress,
         onLog,
       });
@@ -266,7 +579,7 @@ export class HlsPackagerService {
       percent: 89,
     });
 
-    const preparedSubtitles = await prepareSubtitles(job.subtitles, job.outputDir);
+    const preparedSubtitles = await prepareSubtitles(runtimeJob.subtitles, runtimeJob.outputDir);
     const masterSubtitles: MasterSubtitleTrack[] = preparedSubtitles.map((subtitle) => ({
       name: subtitle.name,
       language: subtitle.language,
@@ -280,7 +593,7 @@ export class HlsPackagerService {
       percent: 94,
     });
 
-    const masterPath = await writeMasterPlaylist(job.outputDir, {
+    const masterPath = await writeMasterPlaylist(runtimeJob.outputDir, {
       videoVariants,
       audioTracks: masterAudioTracks,
       subtitles: masterSubtitles,
@@ -292,7 +605,12 @@ export class HlsPackagerService {
       percent: 98,
     });
 
-    const metadataPath = await writeMetadataJson(job.outputDir, {
+    const metadataPath = await writeMetadataJson(runtimeJob.outputDir, {
+      contentType: this.resolveContentType(runtimeJob.contentType),
+      seriesTitle: runtimeJob.seriesTitle,
+      seasonNumber: runtimeJob.seasonNumber,
+      episodeNumber: runtimeJob.episodeNumber,
+      episodeTitle: runtimeJob.episodeTitle,
       qualities: videoVariants.map((variant) => variant.quality),
       audioTracks: masterAudioTracks,
       subtitles: masterSubtitles,
@@ -307,10 +625,13 @@ export class HlsPackagerService {
     return {
       success: true,
       canceled: false,
-      outputDir: job.outputDir,
+      outputDir: runtimeJob.outputDir,
       masterPlaylistPath: masterPath,
       metadataPath,
       selectedEncoder: selectedEncoder.ffmpegEncoder,
+      selectedVideoPipeline: selectedPipelineMode,
+      effectiveSegmentDuration,
+      effectiveOutputFps,
       generatedQualities: videoVariants.map((variant) => variant.quality),
       audioTracks: masterAudioTracks.map((track) => ({
         name: track.name,
@@ -334,12 +655,25 @@ export class HlsPackagerService {
     binaries: BinaryPaths;
     durationSeconds: number;
     job: PackagingJob;
+    effectiveSegmentDuration: number;
     onProgress: (progress: PackagingProgress) => void;
     onLog: (line: string) => void;
+    progressStartPercent?: number;
+    progressEndPercent?: number;
   }): Promise<void> {
-    const { plans, binaries, durationSeconds, job, onProgress, onLog } = input;
-    const startPercent = 70;
-    const endPercent = 88;
+    const {
+      plans,
+      binaries,
+      durationSeconds,
+      job,
+      effectiveSegmentDuration,
+      onProgress,
+      onLog,
+      progressStartPercent,
+      progressEndPercent,
+    } = input;
+    const startPercent = progressStartPercent ?? 70;
+    const endPercent = progressEndPercent ?? 88;
     const total = Math.max(plans.length, 1);
     const progressByTrack = new Array<number>(plans.length).fill(0);
 
@@ -359,7 +693,7 @@ export class HlsPackagerService {
         mapSelector: plan.mapSelector,
         playlistPath: plan.playlistPath,
         segmentPattern: plan.segmentPattern,
-        segmentDuration: job.segmentDuration,
+        segmentDuration: effectiveSegmentDuration,
         audioCodec: plan.sourceCodec ?? undefined,
         audioMode: job.audioMode,
       });
@@ -396,6 +730,35 @@ export class HlsPackagerService {
   private async prepareVideoDirectories(outputDir: string, qualities: QualityPreset[]): Promise<void> {
     const tasks = qualities.map((quality) => fs.mkdir(path.join(outputDir, "video", quality.key), { recursive: true }));
     await Promise.all(tasks);
+  }
+
+  private async prepareVideoSources(
+    outputDir: string,
+    inputVideoPath: string,
+    sourceHeight: number,
+    onProgress: (progress: PackagingProgress) => void
+  ): Promise<void> {
+    const selectedBucket = chooseSourceBucket(sourceHeight);
+    const sourceRoot = path.join(outputDir, "video", "sources");
+    const srcDir = path.join(sourceRoot, selectedBucket);
+    await fs.mkdir(srcDir, { recursive: true });
+
+    const parsed = path.parse(inputVideoPath);
+    const base = safeFileBaseName(parsed.name);
+    const ext = parsed.ext || ".mp4";
+
+    let destPath = path.join(srcDir, `${base}${ext}`);
+    for (let suffix = 2; suffix <= 9999; suffix += 1) {
+      if (!(await pathExists(destPath))) break;
+      destPath = path.join(srcDir, `${base}_${suffix}${ext}`);
+    }
+
+    onProgress({
+      step: "preparing",
+      message: `Copying source video into video/sources/${selectedBucket}/ ...`,
+      percent: 7.2,
+    });
+    await fs.copyFile(inputVideoPath, destPath);
   }
 
   private async prepareAudioPlans(
@@ -477,6 +840,18 @@ export class HlsPackagerService {
       throw new Error("Segment duration must be greater than zero.");
     }
 
+    if (this.resolveContentType(job.contentType) === "series") {
+      if (!job.seriesTitle?.trim()) {
+        throw new Error("Series title is required when content type is set to series.");
+      }
+      if (!Number.isFinite(job.seasonNumber) || (job.seasonNumber ?? 0) < 1) {
+        throw new Error("Season number must be at least 1 for series processing.");
+      }
+      if (!Number.isFinite(job.episodeNumber) || (job.episodeNumber ?? 0) < 1) {
+        throw new Error("Episode number must be at least 1 for series processing.");
+      }
+    }
+
     const defaultCount = audioTracks.filter((track) => track.isDefault).length;
     if (defaultCount > 1) {
       throw new Error("Only one audio track can be marked as default.");
@@ -502,6 +877,214 @@ export class HlsPackagerService {
         throw new Error(`Subtitle file is missing for "${subtitle.name}".`);
       }
     }
+  }
+
+  private optimizeQualitiesForSpeed(
+    requestedQualities: QualityPreset[],
+    sourceWidth: number,
+    sourceHeight: number,
+    mode: PerformanceMode,
+    allowUpscaleQualities: boolean
+  ): { qualities: QualityPreset[]; warnings: string[] } {
+    const warnings: string[] = [];
+    if (mode !== "fast") {
+      return { qualities: requestedQualities, warnings };
+    }
+
+    if (allowUpscaleQualities) {
+      warnings.push("Upscale qualities kept by user confirmation; Fast mode did not remove them.");
+      return { qualities: requestedQualities, warnings };
+    }
+
+    const nonUpscale = requestedQualities.filter(
+      (quality) => !qualityRequiresUpscale(sourceWidth, sourceHeight, quality.width, quality.height)
+    );
+    if (nonUpscale.length === 0) {
+      return { qualities: requestedQualities, warnings };
+    }
+
+    const dropped = requestedQualities.filter((quality) =>
+      qualityRequiresUpscale(sourceWidth, sourceHeight, quality.width, quality.height)
+    );
+    if (dropped.length > 0) {
+      warnings.push(
+        `Fast mode skipped upscale renditions for speed: ${dropped.map((quality) => quality.label).join(", ")}`
+      );
+    }
+
+    return { qualities: nonUpscale, warnings };
+  }
+
+  private adjustBitrateLadderForSource(
+    requestedQualities: QualityPreset[],
+    sourceVideoBitrateKbps: number | undefined,
+    sourceWidth: number,
+    sourceHeight: number
+  ): { qualities: QualityPreset[]; warnings: string[] } {
+    if (!sourceVideoBitrateKbps || sourceVideoBitrateKbps <= 0) {
+      return { qualities: requestedQualities, warnings: [] };
+    }
+
+    const sourcePixels = Math.max(1, sourceWidth * sourceHeight);
+    const tuned = requestedQualities.map((quality) => {
+      const outputPixels = Math.max(1, quality.width * quality.height);
+      const scaleRatio = Math.min(1, outputPixels / sourcePixels);
+      const scaleFactor = Math.pow(scaleRatio, 0.75);
+      const capFromSource = Math.round(sourceVideoBitrateKbps * 1.15 * scaleFactor);
+      const floorByHeight = this.minimumReasonableBitrateKbps(quality.height);
+      const capped = Math.max(floorByHeight, capFromSource);
+      const finalBitrate = Math.min(quality.bitrateKbps, capped);
+      return { ...quality, bitrateKbps: finalBitrate };
+    });
+
+    const warnings: string[] = [];
+    requestedQualities.forEach((quality, index) => {
+      const next = tuned[index];
+      if (next.bitrateKbps < quality.bitrateKbps) {
+        warnings.push(
+          `Adjusted ${quality.label} bitrate from ${quality.bitrateKbps}k to ${next.bitrateKbps}k to match source bitrate and avoid oversized output.`
+        );
+      }
+    });
+
+    return { qualities: tuned, warnings };
+  }
+
+  private minimumReasonableBitrateKbps(height: number): number {
+    if (height >= 1080) return 1800;
+    if (height >= 720) return 900;
+    if (height >= 480) return 500;
+    if (height >= 360) return 350;
+    return 220;
+  }
+
+  private async estimateSourceVideoBitrateKbps(
+    videoInfo: VideoInput,
+    videoPath: string
+  ): Promise<number | undefined> {
+    if (videoInfo.videoBitrateKbps && videoInfo.videoBitrateKbps > 0) {
+      return videoInfo.videoBitrateKbps;
+    }
+
+    if (videoInfo.formatBitrateKbps && videoInfo.formatBitrateKbps > 0) {
+      return Math.max(1, Math.round(videoInfo.formatBitrateKbps * 0.9));
+    }
+
+    if (!Number.isFinite(videoInfo.durationSeconds) || videoInfo.durationSeconds <= 0) {
+      return undefined;
+    }
+
+    try {
+      const stat = await fs.stat(videoPath);
+      const totalKbps = Math.round((stat.size * 8) / Math.max(1, videoInfo.durationSeconds) / 1000);
+      return Math.max(1, Math.round(totalKbps * 0.9));
+    } catch {
+      return undefined;
+    }
+  }
+
+  private resolveEffectiveSegmentDuration(segmentDuration: number, mode: PerformanceMode): number {
+    if (mode === "fast" && segmentDuration < 6) {
+      return 6;
+    }
+    return segmentDuration;
+  }
+
+  private resolveEffectiveOutputFps(sourceFps: number, _mode: PerformanceMode): number | undefined {
+    if (!Number.isFinite(sourceFps) || sourceFps <= 0) return undefined;
+    if (sourceFps > 24) {
+      return 24;
+    }
+    return undefined;
+  }
+
+  private formatDateFolder(now: Date): string {
+    const year = String(now.getFullYear());
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  private resolveContentType(value?: ContentType): ContentType {
+    return value === "series" ? "series" : "movie";
+  }
+
+  private normalizePositiveInteger(value: number | undefined, fallback: number): number {
+    if (!Number.isFinite(value)) return fallback;
+    return Math.max(1, Math.floor(value as number));
+  }
+
+  private buildSeriesEpisodeFolderName(job: PackagingJob): string {
+    const episode = this.normalizePositiveInteger(job.episodeNumber, 1);
+    const base = `episode-${String(episode).padStart(2, "0")}`;
+    const title = sanitizeFolderName((job.episodeTitle ?? "").trim());
+    if (!title || title === "track") {
+      return base;
+    }
+    return `${base}-${title}`;
+  }
+
+  private async resolveRunOutputDirectory(job: PackagingJob): Promise<string> {
+    const { outputDir: baseOutputDir, videoPath, allowOverwrite } = job;
+    const resolvedBase = path.resolve(baseOutputDir);
+    const rootDir = path.parse(resolvedBase).root;
+    if (resolvedBase === rootDir) {
+      throw new Error("Output folder cannot be a drive root.");
+    }
+
+    await fs.mkdir(resolvedBase, { recursive: true });
+
+    const movieTitle = sanitizeFolderName((job.movieTitle ?? "").trim());
+    const movieBaseName =
+      movieTitle || sanitizeFolderName(path.basename(videoPath, path.extname(videoPath)) || "movie");
+    const dateFolder = this.formatDateFolder(new Date());
+    const datedRoot = path.join(resolvedBase, dateFolder);
+    await fs.mkdir(datedRoot, { recursive: true });
+
+    const contentType = this.resolveContentType(job.contentType);
+    const preferredDir =
+      contentType === "series"
+        ? path.join(
+            datedRoot,
+            sanitizeFolderName((job.seriesTitle ?? "").trim() || "series"),
+            `season-${String(this.normalizePositiveInteger(job.seasonNumber, 1)).padStart(2, "0")}`,
+            this.buildSeriesEpisodeFolderName(job)
+          )
+        : path.join(datedRoot, movieBaseName);
+    const preferredExists = await pathExists(preferredDir);
+    if (!preferredExists) {
+      await fs.mkdir(preferredDir, { recursive: true });
+      return preferredDir;
+    }
+
+    const preferredEntries = await fs.readdir(preferredDir);
+    if (preferredEntries.length === 0) {
+      return preferredDir;
+    }
+
+    if (allowOverwrite) {
+      await fs.rm(preferredDir, { recursive: true, force: true });
+      await fs.mkdir(preferredDir, { recursive: true });
+      return preferredDir;
+    }
+
+    const candidateBase = path.basename(preferredDir);
+    const candidateParent = path.dirname(preferredDir);
+    for (let suffix = 2; suffix <= 9999; suffix += 1) {
+      const candidate = path.join(candidateParent, `${candidateBase}_${suffix}`);
+      const candidateExists = await pathExists(candidate);
+      if (!candidateExists) {
+        await fs.mkdir(candidate, { recursive: true });
+        return candidate;
+      }
+
+      const candidateEntries = await fs.readdir(candidate);
+      if (candidateEntries.length === 0) {
+        return candidate;
+      }
+    }
+
+    throw new Error("Could not allocate a unique output folder for this title and date.");
   }
 
   private async prepareOutput(outputDir: string, allowOverwrite: boolean): Promise<void> {
@@ -567,7 +1150,7 @@ export class HlsPackagerService {
       let stderrBuffer = "";
       let stdoutBuffer = "";
       const errorTail: string[] = [];
-      const maxTailLines = 40;
+      const maxTailLines = 200;
 
       const handleLine = (line: string): void => {
         const trimmed = line.trim();
@@ -626,7 +1209,7 @@ export class HlsPackagerService {
           return;
         }
         if (code !== 0) {
-          const tail = errorTail.slice(-20).join("\n");
+          const tail = errorTail.slice(-80).join("\n");
           const message = tail.length > 0 ? `FFmpeg exited with code ${code}:\n${tail}` : `FFmpeg exited with code ${code}.`;
           reject(new Error(message));
           return;
@@ -676,4 +1259,3 @@ export class HlsPackagerService {
     }
   }
 }
-
