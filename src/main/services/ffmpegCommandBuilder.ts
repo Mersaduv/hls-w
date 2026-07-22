@@ -153,24 +153,22 @@ export class FFmpegCommandBuilder {
     segmentDuration: number;
     audioCodec?: string;
     audioMode: AudioMode;
+    audioOffsetMs?: number;
   }): string[] {
     const sourceCodec = (input.audioCodec ?? "").trim().toLowerCase();
     const canCopyAudio = sourceCodec === "aac" || sourceCodec === "mp4a";
-    const useCopy = input.audioMode === "copy-when-possible" && canCopyAudio;
+    const useCopy = input.audioMode === "copy-when-possible" && canCopyAudio && !input.audioOffsetMs;
 
-    const args = [
-      "-y",
-      "-progress",
-      "pipe:1",
-      "-nostats",
-      "-i",
-      input.inputPath,
-      "-map",
-      input.mapSelector,
-      "-vn",
-      "-c:a",
-      useCopy ? "copy" : "aac",
-    ];
+    const args = ["-y", "-progress", "pipe:1", "-nostats"];
+    const offsetMs = input.audioOffsetMs ?? 0;
+    if (offsetMs > 0) {
+      args.push("-itsoffset", String(offsetMs / 1000));
+    }
+    args.push("-i", input.inputPath);
+    if (offsetMs < 0) {
+      args.push("-ss", String(Math.abs(offsetMs) / 1000));
+    }
+    args.push("-map", input.mapSelector, "-vn", "-c:a", useCopy ? "copy" : "aac");
 
     if (!useCopy) {
       args.push("-b:a", "128k", "-ac", "2", "-ar", "48000");

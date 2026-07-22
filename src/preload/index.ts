@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AppSettings, PackagingJob, PackagingProgress } from "@shared/types";
+import type { AppSettings, PackageUpdateJob, PackagingJob, PackagingProgress } from "@shared/types";
 import { IPC_CHANNELS, type ElectronApi, type ResolvedBinaries } from "@shared/ipc";
 
 const api: ElectronApi = {
@@ -7,8 +7,10 @@ const api: ElectronApi = {
   pickAudio: () => ipcRenderer.invoke(IPC_CHANNELS.pickAudio),
   pickSubtitle: () => ipcRenderer.invoke(IPC_CHANNELS.pickSubtitle),
   pickOutputFolder: () => ipcRenderer.invoke(IPC_CHANNELS.pickOutputFolder),
+  pickHlsPackageFolder: () => ipcRenderer.invoke(IPC_CHANNELS.pickHlsPackageFolder),
   probeVideo: (videoPath: string, ffprobePathOverride?: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.probeVideo, videoPath, ffprobePathOverride),
+  scanHlsPackage: (packageDir: string) => ipcRenderer.invoke(IPC_CHANNELS.scanHlsPackage, packageDir),
   loadSettings: () => ipcRenderer.invoke(IPC_CHANNELS.settingsLoad),
   saveSettings: (settings: Partial<AppSettings>) => ipcRenderer.invoke(IPC_CHANNELS.settingsSave, settings),
   resolveBinaries: (ffmpegPathOverride?: string, ffprobePathOverride?: string) =>
@@ -16,6 +18,7 @@ const api: ElectronApi = {
   detectEncoders: (ffmpegPathOverride?: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.detectEncoders, ffmpegPathOverride),
   startPackaging: (job: PackagingJob) => ipcRenderer.invoke(IPC_CHANNELS.startPackaging, job),
+  startPackageUpdate: (job: PackageUpdateJob) => ipcRenderer.invoke(IPC_CHANNELS.startPackageUpdate, job),
   cancelPackaging: () => ipcRenderer.invoke(IPC_CHANNELS.cancelPackaging),
   onPackagingProgress: (listener: (progress: PackagingProgress) => void) => {
     const channel = IPC_CHANNELS.packagingProgress;

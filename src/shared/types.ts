@@ -30,6 +30,8 @@ export interface AudioTrack {
   language: string;
   type: AudioType;
   isDefault: boolean;
+  /** Milliseconds to shift dubbed audio relative to video (positive = delay audio). */
+  audioOffsetMs?: number;
 }
 
 export interface SubtitleTrack {
@@ -91,6 +93,40 @@ export interface PackagingProgress {
   percent: number;
   currentCommand?: string;
   logLine?: string;
+}
+
+export interface PackageUpdateJob {
+  packageDir: string;
+  newSubtitles: SubtitleTrack[];
+  newAudioTracks: AudioTrack[];
+  segmentDuration?: number;
+  audioMode: AudioMode;
+  parallelAudioProcessing: boolean;
+  ffmpegPathOverride?: string;
+  ffprobePathOverride?: string;
+}
+
+export interface PackageUpdateResult {
+  success: boolean;
+  canceled: boolean;
+  packageDir: string;
+  masterPlaylistPath?: string;
+  metadataPath?: string;
+  addedSubtitles: Array<{
+    name: string;
+    language: string;
+    isDefault: boolean;
+    uri: string;
+  }>;
+  addedAudioTracks: Array<{
+    name: string;
+    language: string;
+    type: AudioType;
+    isDefault: boolean;
+    uri: string;
+  }>;
+  warnings: string[];
+  error?: string;
 }
 
 export interface PackagingResult {
@@ -164,4 +200,36 @@ export interface ProbeWarning {
   type: "upscale";
   message: string;
   qualities: QualityKey[];
+}
+
+export interface ScannedHlsPackage {
+  packageDir: string;
+  masterPlaylistPath: string;
+  metadataPath?: string;
+  parsed: {
+    videoVariants: Array<{
+      quality: string;
+      width: number;
+      height: number;
+      bitrateKbps: number;
+      uri: string;
+    }>;
+    audioTracks: Array<{
+      name: string;
+      language: string;
+      type: AudioType;
+      isDefault: boolean;
+      uri?: string;
+    }>;
+    subtitles: Array<{
+      name: string;
+      language: string;
+      isDefault: boolean;
+      uri: string;
+    }>;
+    audioGroupId: string;
+    subtitleGroupId: string;
+  };
+  segmentDuration: number;
+  durationSeconds: number;
 }

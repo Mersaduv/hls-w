@@ -1,16 +1,21 @@
-import { startTransition, useDeferredValue, useEffect, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { DEFAULT_SETTINGS, QUALITY_BUNDLES, QUALITY_PRESETS } from "@shared/defaults";
 import type {
   AppSettings,
   AudioTrack,
   ContentType,
+  PackageUpdateJob,
+  PackageUpdateResult,
   PackagingJob,
   PackagingProgress,
   PackagingResult,
   QualityPreset,
+  ScannedHlsPackage,
   SubtitleTrack,
   VideoInput,
 } from "@shared/types";
+
+type WorkMode = "package" | "update";
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -31,74 +36,9 @@ function cloneQualityDefaults(): QualityPreset[] {
   return QUALITY_PRESETS.map((item) => ({ ...item }));
 }
 
-function resetJobState(params: {
-  setVideoPath: (v: string) => void;
-  setVideoInfo: (v: VideoInput | null) => void;
-  setPreferredAudioLanguage: (v: string) => void;
-  setAudioTracks: (v: AudioTrack[]) => void;
-  setSubtitles: (v: SubtitleTrack[]) => void;
-  setQualities: (v: QualityPreset[]) => void;
-  setOutputDir: (v: string) => void;
-  setAllowOverwrite: (v: boolean) => void;
-  setContentType: (v: ContentType) => void;
-  setMovieTitle: (v: string) => void;
-  setSeriesTitle: (v: string) => void;
-  setSeasonNumber: (v: number) => void;
-  setEpisodeNumber: (v: number) => void;
-  setEpisodeTitle: (v: string) => void;
-  setValidationErrors: (v: string[]) => void;
-  setWarnings: (v: string[]) => void;
-  setLogs: (v: string[]) => void;
-  setShowLogs: (v: boolean) => void;
-  setShowCommand: (v: boolean) => void;
-  setCurrentCommand: (v: string) => void;
-  setProgress: (v: PackagingProgress) => void;
-  setIsPackaging: (v: boolean) => void;
-  setResult: (v: PackagingResult | null) => void;
-  setMasterPreview: (v: string) => void;
-  setPackagingStartedAt: (v: number | null) => void;
-  setElapsedSeconds: (v: number) => void;
-  setRemainingSeconds: (v: number | null) => void;
-  setMaxProgressSeen: (v: number) => void;
-  setStatusMessage: (v: string) => void;
-}): void {
-  params.setVideoPath("");
-  params.setVideoInfo(null);
-  params.setPreferredAudioLanguage("und");
-  params.setAudioTracks([]);
-  params.setSubtitles([]);
-  params.setQualities(cloneQualityDefaults());
-  params.setOutputDir("");
-  params.setAllowOverwrite(false);
-
-  params.setContentType("movie");
-  params.setMovieTitle("");
-  params.setSeriesTitle("");
-  params.setSeasonNumber(1);
-  params.setEpisodeNumber(1);
-  params.setEpisodeTitle("");
-
-  params.setValidationErrors([]);
-  params.setWarnings([]);
-  params.setLogs([]);
-  params.setShowLogs(false);
-  params.setShowCommand(false);
-  params.setCurrentCommand("");
-
-  params.setProgress({
-    step: "preparing",
-    message: "Idle",
-    percent: 0,
-  });
-
-  params.setIsPackaging(false);
-  params.setResult(null);
-  params.setMasterPreview("");
-  params.setPackagingStartedAt(null);
-  params.setElapsedSeconds(0);
-  params.setRemainingSeconds(null);
-  params.setMaxProgressSeen(0);
-  params.setStatusMessage("Ready.");
+function previewSafeName(value: string, fallback: string): string {
+  const cleaned = value.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_");
+  return cleaned.length > 0 ? cleaned : fallback;
 }
 
 function formatClock(totalSeconds: number): string {
@@ -113,20 +53,6 @@ function formatClock(totalSeconds: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-function previewSafeName(value: string, fallback: string): string {
-  const cleaned = value.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_");
-  return cleaned.length > 0 ? cleaned : fallback;
-}
-
-function videoBaseName(videoPath: string): string {
-  if (!videoPath.trim()) return "movie";
-  const file = basename(videoPath);
-  const dotIndex = file.lastIndexOf(".");
-  if (dotIndex <= 0) return previewSafeName(file, "movie");
-  return previewSafeName(file.slice(0, dotIndex), "movie");
-}
-
-/** Matches packager `chooseSourceBucket`: only this folder under video/sources/ receives the source copy. */
 function sourceCopyTierFolder(sourceHeight: number): string | null {
   if (!Number.isFinite(sourceHeight) || sourceHeight <= 0) return null;
   if (sourceHeight >= 1080) return "1080";
@@ -136,41 +62,71 @@ function sourceCopyTierFolder(sourceHeight: number): string | null {
   return "240";
 }
 
-function buildOutputPreview(
-  qualities: QualityPreset[],
-  audios: AudioTrack[],
-  subtitles: SubtitleTrack[],
-  contentType: ContentType,
-  videoPath: string,
-  movieTitle: string,
-  seriesTitle: string,
-  seasonNumber: number,
-  episodeNumber: number,
-  episodeTitle: string,
-  videoInfo: VideoInput | null
-): string {
+function requiresUpscale(sourceWidth: number, sourceHeight: number, targetWidth: number, targetHeight: number): boolean {
+  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
+  const widthScale = targetWidth / sourceWidth;
+  const heightScale = targetHeight / sourceHeight;
+  return Math.min(widthScale, heightScale) > 1;
+}
+
+function normalizedLang(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9-]/g, "") || "und";
+}
+
+function subtitleIdentity(name: string, language: string): string {
+  return `${normalizedLang(language)}|${name.trim().toLowerCase()}`;
+}
+
+function audioIdentity(name: string, language: string, type: AudioTrack["type"]): string {
+  return `${normalizedLang(language)}|${name.trim().toLowerCase()}|${type}`;
+}
+
+function buildOutputPreview(input: {
+  qualities: QualityPreset[];
+  audioTracks: AudioTrack[];
+  subtitles: SubtitleTrack[];
+  contentType: ContentType;
+  movieTitle: string;
+  seriesTitle: string;
+  seasonNumber: number;
+  episodeNumber: number;
+  episodeTitle: string;
+  videoInfo: VideoInput | null;
+}): string {
+  const {
+    qualities,
+    audioTracks,
+    subtitles,
+    contentType,
+    movieTitle,
+    seriesTitle,
+    seasonNumber,
+    episodeNumber,
+    episodeTitle,
+    videoInfo,
+  } = input;
   const normalizedSeason = Number.isFinite(seasonNumber) ? Math.max(1, Math.floor(seasonNumber)) : 1;
   const normalizedEpisode = Number.isFinite(episodeNumber) ? Math.max(1, Math.floor(episodeNumber)) : 1;
-  const movieFolder = previewSafeName(movieTitle.trim() || videoBaseName(videoPath), "movie");
-  const seriesFolder = previewSafeName(seriesTitle || "series", "series");
+  const movieFolder = previewSafeName(movieTitle.trim(), "movie-title-required");
+  const seriesFolder = previewSafeName(seriesTitle.trim() || "series", "series");
   const episodeBase = `episode-${String(normalizedEpisode).padStart(2, "0")}`;
   const episodeName =
     contentType === "series" && episodeTitle.trim()
       ? `${episodeBase}-${previewSafeName(episodeTitle, "episode")}`
       : episodeBase;
-  const topFolder =
+
+  const root =
     contentType === "series"
       ? `YYYY-MM-DD/${seriesFolder}/season-${String(normalizedSeason).padStart(2, "0")}/${episodeName}/`
       : `YYYY-MM-DD/${movieFolder}/`;
-
-  const lines: string[] = [topFolder, "  master.m3u8", "  metadata.json", "  video/"];
-
   const sourceTier = videoInfo ? sourceCopyTierFolder(videoInfo.height) : null;
-  lines.push("    sources/");
+  const sourceName = contentType === "series" ? seriesFolder : movieFolder;
+
+  const lines: string[] = [root, "  master.m3u8", "  metadata.json", "  video/", "    sources/"];
   if (sourceTier) {
-    lines.push(`      ${sourceTier}/  (original file copy only — no empty sibling tiers)`);
+    lines.push(`      ${sourceTier}/${sourceName}.mp4`);
   } else {
-    lines.push("      (one tier only, from source height after probe)");
+    lines.push("      {source-tier}/{title}.mp4");
   }
 
   for (const quality of qualities.filter((q) => q.enabled).sort((a, b) => b.height - a.height)) {
@@ -180,7 +136,7 @@ function buildOutputPreview(
   }
 
   lines.push("  audio/");
-  for (const audio of audios) {
+  for (const audio of audioTracks) {
     const lang = audio.language.trim() || "und";
     lines.push(`    ${lang}/`);
     lines.push("      index.m3u8");
@@ -194,45 +150,16 @@ function buildOutputPreview(
       lines.push(`    ${lang}.vtt`);
     }
   }
-
   return lines.join("\n");
 }
 
-function requiresUpscale(sourceWidth: number, sourceHeight: number, targetWidth: number, targetHeight: number): boolean {
-  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
-  const widthScale = targetWidth / sourceWidth;
-  const heightScale = targetHeight / sourceHeight;
-  // Matches ffmpeg scale with force_original_aspect_ratio=decrease.
-  return Math.min(widthScale, heightScale) > 1;
-}
-
 export default function App() {
-  const [videoPath, setVideoPath] = useState("");
-  const [videoInfo, setVideoInfo] = useState<VideoInput | null>(null);
-  const [preferredAudioLanguage, setPreferredAudioLanguage] = useState("und");
-  const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
-  const [subtitles, setSubtitles] = useState<SubtitleTrack[]>([]);
-  const [qualities, setQualities] = useState<QualityPreset[]>(cloneQualityDefaults);
-  const [outputDir, setOutputDir] = useState("");
-  const [contentType, setContentType] = useState<ContentType>("movie");
-  const [movieTitle, setMovieTitle] = useState("");
-  const [seriesTitle, setSeriesTitle] = useState("");
-  const [seasonNumber, setSeasonNumber] = useState(1);
-  const [episodeNumber, setEpisodeNumber] = useState(1);
-  const [episodeTitle, setEpisodeTitle] = useState("");
-
-  const [segmentDuration, setSegmentDuration] = useState(DEFAULT_SETTINGS.segmentDuration);
-  const [ffmpegPath, setFfmpegPath] = useState("");
-  const [ffprobePath, setFfprobePath] = useState("");
-  const [useHardwareAcceleration, setUseHardwareAcceleration] = useState(
-    DEFAULT_SETTINGS.useHardwareAcceleration
-  );
-  const [performanceMode, setPerformanceMode] = useState(DEFAULT_SETTINGS.performanceMode);
-  const [encoderPreference, setEncoderPreference] = useState(DEFAULT_SETTINGS.encoderPreference);
-  const [audioMode, setAudioMode] = useState(DEFAULT_SETTINGS.audioMode);
-  const [parallelAudioProcessing, setParallelAudioProcessing] = useState(DEFAULT_SETTINGS.parallelAudioProcessing);
-  const [encoderStatus, setEncoderStatus] = useState("Encoder detection not run yet.");
-  const [theme, setTheme] = useState(DEFAULT_SETTINGS.theme);
+  const [workMode, setWorkMode] = useState<WorkMode>("package");
+  const [isRunning, setIsRunning] = useState(false);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
+  const [maxProgressSeen, setMaxProgressSeen] = useState(0);
 
   const [statusMessage, setStatusMessage] = useState("Ready.");
   const [warnings, setWarnings] = useState<string[]>([]);
@@ -241,106 +168,106 @@ export default function App() {
   const [showLogs, setShowLogs] = useState(false);
   const [showCommand, setShowCommand] = useState(false);
   const [currentCommand, setCurrentCommand] = useState("");
-
+  const [masterPreview, setMasterPreview] = useState("");
   const [progress, setProgress] = useState<PackagingProgress>({
     step: "preparing",
     message: "Idle",
     percent: 0,
   });
-  const [isPackaging, setIsPackaging] = useState(false);
+
   const [result, setResult] = useState<PackagingResult | null>(null);
-  const [masterPreview, setMasterPreview] = useState("");
+  const [updateResult, setUpdateResult] = useState<PackageUpdateResult | null>(null);
+
+  const [videoPath, setVideoPath] = useState("");
+  const [videoInfo, setVideoInfo] = useState<VideoInput | null>(null);
+  const [contentType, setContentType] = useState<ContentType>("movie");
+  const [movieTitle, setMovieTitle] = useState("");
+  const [seriesTitle, setSeriesTitle] = useState("");
+  const [seasonNumber, setSeasonNumber] = useState(1);
+  const [episodeNumber, setEpisodeNumber] = useState(1);
+  const [episodeTitle, setEpisodeTitle] = useState("");
+  const [preferredAudioLanguage, setPreferredAudioLanguage] = useState("und");
+  const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
+  const [subtitles, setSubtitles] = useState<SubtitleTrack[]>([]);
+  const [qualities, setQualities] = useState<QualityPreset[]>(cloneQualityDefaults);
+  const [outputDir, setOutputDir] = useState("");
   const [allowOverwrite, setAllowOverwrite] = useState(false);
+
+  const [packageDir, setPackageDir] = useState("");
+  const [scannedPackage, setScannedPackage] = useState<ScannedHlsPackage | null>(null);
+  const [updateSubtitles, setUpdateSubtitles] = useState<SubtitleTrack[]>([]);
+  const [updateAudioTracks, setUpdateAudioTracks] = useState<AudioTrack[]>([]);
+
+  const [segmentDuration, setSegmentDuration] = useState(DEFAULT_SETTINGS.segmentDuration);
+  const [ffmpegPath, setFfmpegPath] = useState("");
+  const [ffprobePath, setFfprobePath] = useState("");
+  const [useHardwareAcceleration, setUseHardwareAcceleration] = useState(DEFAULT_SETTINGS.useHardwareAcceleration);
+  const [performanceMode, setPerformanceMode] = useState(DEFAULT_SETTINGS.performanceMode);
+  const [encoderPreference, setEncoderPreference] = useState(DEFAULT_SETTINGS.encoderPreference);
+  const [audioMode, setAudioMode] = useState(DEFAULT_SETTINGS.audioMode);
+  const [parallelAudioProcessing, setParallelAudioProcessing] = useState(DEFAULT_SETTINGS.parallelAudioProcessing);
+  const [theme, setTheme] = useState(DEFAULT_SETTINGS.theme);
+  const [encoderStatus, setEncoderStatus] = useState("Encoder detection not run yet.");
   const [vlcAvailable, setVlcAvailable] = useState(false);
-  const [packagingStartedAt, setPackagingStartedAt] = useState<number | null>(null);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
-  const [maxProgressSeen, setMaxProgressSeen] = useState(0);
 
   const deferredLogs = useDeferredValue(logs);
+  const safeProgress = Math.min(100, Math.max(0, progress.percent));
 
-  function clearAll(): void {
-    resetJobState({
-      setVideoPath,
-      setVideoInfo,
-      setPreferredAudioLanguage,
-      setAudioTracks,
-      setSubtitles,
-      setQualities,
-      setOutputDir,
-      setAllowOverwrite,
-      setContentType,
-      setMovieTitle,
-      setSeriesTitle,
-      setSeasonNumber,
-      setEpisodeNumber,
-      setEpisodeTitle,
-      setValidationErrors,
-      setWarnings,
-      setLogs,
-      setShowLogs,
-      setShowCommand,
-      setCurrentCommand,
-      setProgress,
-      setIsPackaging,
-      setResult,
-      setMasterPreview,
-      setPackagingStartedAt,
-      setElapsedSeconds,
-      setRemainingSeconds,
-      setMaxProgressSeen,
-      setStatusMessage,
-    });
-  }
+  const outputPreview = useMemo(
+    () =>
+      buildOutputPreview({
+        qualities,
+        audioTracks,
+        subtitles,
+        contentType,
+        movieTitle,
+        seriesTitle,
+        seasonNumber,
+        episodeNumber,
+        episodeTitle,
+        videoInfo,
+      }),
+    [qualities, audioTracks, subtitles, contentType, movieTitle, seriesTitle, seasonNumber, episodeNumber, episodeTitle, videoInfo]
+  );
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
   useEffect(() => {
-    if (!isPackaging || packagingStartedAt === null) return;
+    if (!isRunning || startedAt === null) return;
     const timer = window.setInterval(() => {
-      setElapsedSeconds(Math.max(0, Math.floor((Date.now() - packagingStartedAt) / 1000)));
-      setRemainingSeconds((prev) => {
-        if (prev === null) return null;
-        return Math.max(0, prev - 1);
-      });
+      setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+      setEtaSeconds((prev) => (prev === null ? null : Math.max(0, prev - 1)));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [isPackaging, packagingStartedAt]);
+  }, [isRunning, startedAt]);
 
   useEffect(() => {
     const offProgress = window.electronAPI.onPackagingProgress((payload) => {
       setProgress(payload);
-      if (payload.currentCommand) {
-        setCurrentCommand(payload.currentCommand);
-      }
+      if (payload.currentCommand) setCurrentCommand(payload.currentCommand);
+
       if (payload.percent > 0 && payload.percent <= 100) {
-        setMaxProgressSeen((prevMax) => {
-          const nextMax = Math.max(prevMax, payload.percent);
-          if (packagingStartedAt !== null && nextMax > 0) {
-            const elapsed = Math.max(0, Math.floor((Date.now() - packagingStartedAt) / 1000));
-            const candidate = Math.max(0, Math.round((elapsed * (100 - nextMax)) / nextMax));
-            setRemainingSeconds((prevRemaining) =>
-              prevRemaining === null ? candidate : Math.min(prevRemaining, candidate)
-            );
+        setMaxProgressSeen((prev) => {
+          const next = Math.max(prev, payload.percent);
+          if (startedAt !== null && next > 0) {
+            const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+            const estimate = Math.max(0, Math.round((elapsed * (100 - next)) / next));
+            setEtaSeconds((old) => (old === null ? estimate : Math.min(old, estimate)));
           }
-          return nextMax;
+          return next;
         });
       }
+
       if (payload.step === "completed") {
-        setIsPackaging(false);
-        setRemainingSeconds(0);
-        setMaxProgressSeen(100);
-        setStatusMessage("Packaging finished.");
+        setIsRunning(false);
+        setEtaSeconds(0);
+        setStatusMessage(workMode === "update" ? "Package update finished." : "Packaging finished.");
       } else if (payload.step === "failed") {
-        setIsPackaging(false);
-        setRemainingSeconds(null);
-        setStatusMessage(payload.message);
+        setIsRunning(false);
       } else if (payload.step === "canceled") {
-        setIsPackaging(false);
-        setRemainingSeconds(null);
-        setStatusMessage("Packaging canceled.");
+        setIsRunning(false);
       }
     });
 
@@ -354,21 +281,19 @@ export default function App() {
     });
 
     void (async () => {
-      const vlcCheck = await window.electronAPI.detectVlc();
-      if (vlcCheck.ok && vlcCheck.data) {
-        setVlcAvailable(vlcCheck.data.exists);
-      }
-
-      const encoderCheck = await window.electronAPI.detectEncoders(undefined);
-      if (encoderCheck.ok && encoderCheck.data) {
-        const capabilityParts: string[] = [];
-        capabilityParts.push(encoderCheck.data.capabilities.nvidiaNvenc ? "NVENC" : "NVENC unavailable");
-        capabilityParts.push(encoderCheck.data.capabilities.intelQsv ? "QSV" : "QSV unavailable");
-        capabilityParts.push(encoderCheck.data.capabilities.amdAmf ? "AMF" : "AMF unavailable");
-        capabilityParts.push(`Auto picks: ${encoderCheck.data.preferredEncoder}`);
-        setEncoderStatus(capabilityParts.join(" | "));
+      const vlc = await window.electronAPI.detectVlc();
+      if (vlc.ok && vlc.data) setVlcAvailable(vlc.data.exists);
+      const enc = await window.electronAPI.detectEncoders(undefined);
+      if (enc.ok && enc.data) {
+        const parts = [
+          enc.data.capabilities.nvidiaNvenc ? "NVENC" : "NVENC unavailable",
+          enc.data.capabilities.intelQsv ? "QSV" : "QSV unavailable",
+          enc.data.capabilities.amdAmf ? "AMF" : "AMF unavailable",
+          `Auto picks: ${enc.data.preferredEncoder}`,
+        ];
+        setEncoderStatus(parts.join(" | "));
       } else {
-        setEncoderStatus(encoderCheck.error ?? "Encoder detection failed.");
+        setEncoderStatus(enc.error ?? "Encoder detection failed.");
       }
     })();
 
@@ -376,127 +301,132 @@ export default function App() {
       offProgress();
       offLog();
     };
-  }, []);
-
-  const outputPreview = buildOutputPreview(
-    qualities,
-    audioTracks,
-    subtitles,
-    contentType,
-    videoPath,
-    movieTitle,
-    seriesTitle,
-    seasonNumber,
-    episodeNumber,
-    episodeTitle,
-    videoInfo
-  );
+  }, [startedAt, workMode]);
 
   useEffect(() => {
     if (!videoInfo) return;
     setQualities((prev) =>
       prev.map((quality) => {
-        const isUpscale = requiresUpscale(videoInfo.width, videoInfo.height, quality.width, quality.height);
-        return isUpscale && quality.enabled ? { ...quality, enabled: false } : quality;
+        const disabledBySource = requiresUpscale(videoInfo.width, videoInfo.height, quality.width, quality.height);
+        return disabledBySource && quality.enabled ? { ...quality, enabled: false } : quality;
       })
     );
   }, [videoInfo]);
 
+  function resetRunUi(): void {
+    setValidationErrors([]);
+    setWarnings([]);
+    setLogs([]);
+    setShowLogs(false);
+    setShowCommand(false);
+    setCurrentCommand("");
+    setProgress({ step: "preparing", message: "Idle", percent: 0 });
+    setIsRunning(false);
+    setStartedAt(null);
+    setElapsedSeconds(0);
+    setEtaSeconds(null);
+    setMaxProgressSeen(0);
+  }
+
+  function clearAll(): void {
+    resetRunUi();
+    setStatusMessage("Ready.");
+    setResult(null);
+    setUpdateResult(null);
+    setMasterPreview("");
+
+    setVideoPath("");
+    setVideoInfo(null);
+    setContentType("movie");
+    setMovieTitle("");
+    setSeriesTitle("");
+    setSeasonNumber(1);
+    setEpisodeNumber(1);
+    setEpisodeTitle("");
+    setPreferredAudioLanguage("und");
+    setAudioTracks([]);
+    setSubtitles([]);
+    setQualities(cloneQualityDefaults());
+    setOutputDir("");
+    setAllowOverwrite(false);
+
+    setPackageDir("");
+    setScannedPackage(null);
+    setUpdateSubtitles([]);
+    setUpdateAudioTracks([]);
+  }
+
   async function pickVideo(): Promise<void> {
     const selected = await window.electronAPI.pickVideo();
     if (!selected) return;
-    // New input video => clear previous job fields.
-    resetJobState({
-      setVideoPath,
-      setVideoInfo,
-      setPreferredAudioLanguage,
-      setAudioTracks,
-      setSubtitles,
-      setQualities,
-      setOutputDir,
-      setAllowOverwrite,
-      setContentType,
-      setMovieTitle,
-      setSeriesTitle,
-      setSeasonNumber,
-      setEpisodeNumber,
-      setEpisodeTitle,
-      setValidationErrors,
-      setWarnings,
-      setLogs,
-      setShowLogs,
-      setShowCommand,
-      setCurrentCommand,
-      setProgress,
-      setIsPackaging,
-      setResult,
-      setMasterPreview,
-      setPackagingStartedAt,
-      setElapsedSeconds,
-      setRemainingSeconds,
-      setMaxProgressSeen,
-      setStatusMessage,
-    });
+    resetRunUi();
+    setStatusMessage("Analyzing video...");
+    setResult(null);
+    setMasterPreview("");
     setVideoPath(selected);
-    setStatusMessage("Analyzing video with ffprobe...");
-
-    const probe = await window.electronAPI.probeVideo(selected, ffprobePath || undefined);
+    const probe = await window.electronAPI.probeVideo(selected, ffprobePath.trim() || undefined);
     if (!probe.ok || !probe.data) {
       setVideoInfo(null);
-      setStatusMessage(probe.error ?? "Failed to read video info.");
+      setStatusMessage(probe.error ?? "Failed to probe video.");
       return;
     }
-
     setVideoInfo(probe.data);
-    const detectedAudioLanguage = probe.data.defaultAudioLanguage?.trim().toLowerCase() || "und";
-    setPreferredAudioLanguage(detectedAudioLanguage);
-    setAudioTracks((prev) =>
-      prev.map((track) => (track.language.trim() ? track : { ...track, language: detectedAudioLanguage }))
-    );
+    const detectedLang = probe.data.defaultAudioLanguage?.trim().toLowerCase() || "und";
+    setPreferredAudioLanguage(detectedLang);
     setWarnings(probe.warnings ?? []);
     setStatusMessage("Video analyzed successfully.");
   }
 
-  function updateAudioTrack(id: string, partial: Partial<AudioTrack>): void {
-    setAudioTracks((prev) => prev.map((track) => (track.id === id ? { ...track, ...partial } : track)));
-  }
-
-  function removeAudioTrack(id: string): void {
-    setAudioTracks((prev) => prev.filter((track) => track.id !== id));
+  async function pickOutputFolder(): Promise<void> {
+    const selected = await window.electronAPI.pickOutputFolder();
+    if (selected) setOutputDir(selected);
   }
 
   async function addExternalAudio(): Promise<void> {
     const picked = await window.electronAPI.pickAudio();
     if (!picked) return;
-    const track: AudioTrack = {
-      id: makeId(),
-      source: "external",
-      filePath: picked,
-      name: basename(picked),
-      language: preferredAudioLanguage,
-      type: "dubbed",
-      isDefault: audioTracks.length === 0,
-    };
-    setAudioTracks((prev) => [...prev, track]);
+    setAudioTracks((prev) => [
+      ...prev,
+      {
+        id: makeId(),
+        source: "external",
+        filePath: picked,
+        name: basename(picked),
+        language: preferredAudioLanguage,
+        type: "dubbed",
+        isDefault: prev.length === 0,
+        audioOffsetMs: 0,
+      },
+    ]);
   }
 
   function addOriginalAudio(): void {
-    const track: AudioTrack = {
-      id: makeId(),
-      source: "video-original",
-      name: "Original Audio",
-      language: preferredAudioLanguage,
-      type: "original",
-      isDefault: audioTracks.length === 0,
-    };
-    setAudioTracks((prev) => [...prev, track]);
+    setAudioTracks((prev) => [
+      ...prev,
+      {
+        id: makeId(),
+        source: "video-original",
+        name: "Original Audio",
+        language: preferredAudioLanguage,
+        type: "original",
+        isDefault: prev.length === 0,
+      },
+    ]);
+  }
+
+  function updateAudioTrack(id: string, partial: Partial<AudioTrack>): void {
+    setAudioTracks((prev) => prev.map((item) => (item.id === id ? { ...item, ...partial } : item)));
+  }
+
+  function removeAudioTrack(id: string): void {
+    setAudioTracks((prev) => prev.filter((item) => item.id !== id));
   }
 
   function setDefaultAudio(id: string, enabled: boolean): void {
     setAudioTracks((prev) =>
-      prev.map((track) => {
-        if (track.id === id) return { ...track, isDefault: enabled };
-        return enabled ? { ...track, isDefault: false } : track;
+      prev.map((item) => {
+        if (item.id === id) return { ...item, isDefault: enabled };
+        return enabled ? { ...item, isDefault: false } : item;
       })
     );
   }
@@ -504,15 +434,17 @@ export default function App() {
   async function addSubtitle(): Promise<void> {
     const picked = await window.electronAPI.pickSubtitle();
     if (!picked) return;
-    const subtitle: SubtitleTrack = {
-      id: makeId(),
-      filePath: picked,
-      name: basename(picked),
-      language: "fa",
-      isDefault: false,
-      inputFormat: subtitleFormat(picked),
-    };
-    setSubtitles((prev) => [...prev, subtitle]);
+    setSubtitles((prev) => [
+      ...prev,
+      {
+        id: makeId(),
+        filePath: picked,
+        name: basename(picked),
+        language: "fa",
+        isDefault: false,
+        inputFormat: subtitleFormat(picked),
+      },
+    ]);
   }
 
   function updateSubtitle(id: string, partial: Partial<SubtitleTrack>): void {
@@ -520,103 +452,89 @@ export default function App() {
   }
 
   function removeSubtitle(id: string): void {
-    setSubtitles((prev) => prev.filter((subtitle) => subtitle.id !== id));
+    setSubtitles((prev) => prev.filter((item) => item.id !== id));
   }
 
   function setDefaultSubtitle(id: string, enabled: boolean): void {
     setSubtitles((prev) =>
-      prev.map((subtitle) => {
-        if (subtitle.id === id) return { ...subtitle, isDefault: enabled };
-        return enabled ? { ...subtitle, isDefault: false } : subtitle;
+      prev.map((item) => {
+        if (item.id === id) return { ...item, isDefault: enabled };
+        return enabled ? { ...item, isDefault: false } : item;
       })
     );
   }
 
   function updateQuality(key: QualityPreset["key"], partial: Partial<QualityPreset>): void {
-    setQualities((prev) => prev.map((quality) => (quality.key === key ? { ...quality, ...partial } : quality)));
+    setQualities((prev) => prev.map((item) => (item.key === key ? { ...item, ...partial } : item)));
   }
 
   function applyLadderPreset(mode: keyof typeof QUALITY_BUNDLES): void {
     setQualities((prev) =>
-      prev.map((quality) => ({
-        ...quality,
+      prev.map((item) => ({
+        ...item,
         enabled: true,
-        bitrateKbps: QUALITY_BUNDLES[mode][quality.key],
+        bitrateKbps: QUALITY_BUNDLES[mode][item.key],
       }))
     );
   }
 
-  async function pickOutputFolder(): Promise<void> {
-    const selected = await window.electronAPI.pickOutputFolder();
-    if (!selected) return;
-    setOutputDir(selected);
-  }
-
-  function validateForm(): string[] {
+  function validatePackageForm(): string[] {
     const errors: string[] = [];
     if (!videoPath.trim()) errors.push("Input video is required.");
     if (!outputDir.trim()) errors.push("Output folder is required.");
+    if (contentType === "movie" && !movieTitle.trim()) errors.push("Movie title is required.");
     if (contentType === "series") {
-      if (!seriesTitle.trim()) errors.push("Series title is required in series mode.");
+      if (!seriesTitle.trim()) errors.push("Series title is required.");
       if (!Number.isFinite(seasonNumber) || seasonNumber < 1) errors.push("Season number must be at least 1.");
       if (!Number.isFinite(episodeNumber) || episodeNumber < 1) errors.push("Episode number must be at least 1.");
     }
-    if (!qualities.some((quality) => quality.enabled)) errors.push("Enable at least one quality.");
-    if (audioTracks.length === 0) errors.push("Add at least one audio track or use original audio.");
+    if (!qualities.some((q) => q.enabled)) errors.push("Enable at least one quality.");
+    if (audioTracks.length === 0) errors.push("Add at least one audio track.");
+    if (segmentDuration <= 0 || Number.isNaN(segmentDuration)) errors.push("Segment duration must be greater than zero.");
 
-    const defaultAudioCount = audioTracks.filter((track) => track.isDefault).length;
+    const defaultAudioCount = audioTracks.filter((a) => a.isDefault).length;
     if (defaultAudioCount > 1) errors.push("Only one default audio track is allowed.");
-    if (defaultAudioCount === 0 && audioTracks.length > 0) errors.push("Set one audio track as default.");
+    if (defaultAudioCount === 0 && audioTracks.length > 0) errors.push("Set one default audio track.");
 
     for (const track of audioTracks) {
-      if (!track.name.trim()) errors.push("Every audio track must have a display name.");
+      if (!track.name.trim()) errors.push("Audio track name is required.");
       if (!track.language.trim()) errors.push(`Language code is required for audio track "${track.name || "Unnamed"}".`);
-      if (track.source === "external" && !track.filePath) {
-        errors.push(`Audio file is required for "${track.name || "Unnamed"}".`);
-      }
+      if (track.source === "external" && !track.filePath) errors.push(`Audio file is required for "${track.name || "Unnamed"}".`);
     }
-
-    for (const subtitle of subtitles) {
-      if (!subtitle.name.trim()) errors.push("Every subtitle track must have a name.");
-      if (!subtitle.language.trim()) {
-        errors.push(`Language code is required for subtitle "${subtitle.name || "Unnamed"}".`);
-      }
+    for (const sub of subtitles) {
+      if (!sub.name.trim()) errors.push("Subtitle name is required.");
+      if (!sub.language.trim()) errors.push(`Language code is required for subtitle "${sub.name || "Unnamed"}".`);
+      if (!sub.filePath) errors.push(`Subtitle file is required for "${sub.name || "Unnamed"}".`);
     }
-
-    if (segmentDuration <= 0 || Number.isNaN(segmentDuration)) {
-      errors.push("Segment duration must be greater than zero.");
-    }
-
     return errors;
   }
 
   async function startPackaging(): Promise<void> {
-    if (isPackaging) return;
-    setValidationErrors([]);
-    setWarnings([]);
-    setResult(null);
-    setMasterPreview("");
-
-    const errors = validateForm();
+    if (isRunning) return;
+    const errors = validatePackageForm();
     if (errors.length > 0) {
       setValidationErrors(errors);
       setStatusMessage("Please fix validation errors.");
       return;
     }
 
-    setIsPackaging(true);
-    setPackagingStartedAt(Date.now());
-    setElapsedSeconds(0);
-    setRemainingSeconds(null);
-    setMaxProgressSeen(0);
+    setValidationErrors([]);
+    setWarnings([]);
+    setResult(null);
+    setMasterPreview("");
     setLogs([]);
     setShowLogs(true);
+    setStartedAt(Date.now());
+    setElapsedSeconds(0);
+    setEtaSeconds(null);
+    setMaxProgressSeen(0);
+    setIsRunning(true);
     setStatusMessage("Starting packaging...");
 
     const job: PackagingJob = {
       videoPath,
       outputDir,
-      movieTitle: contentType === "movie" ? movieTitle.trim() || undefined : undefined,
+      movieTitle: contentType === "movie" ? movieTitle.trim() : undefined,
       contentType,
       seriesTitle: contentType === "series" ? seriesTitle.trim() : undefined,
       seasonNumber: contentType === "series" ? Math.max(1, Math.floor(seasonNumber || 1)) : undefined,
@@ -638,61 +556,244 @@ export default function App() {
     };
 
     const response = await window.electronAPI.startPackaging(job);
-    setIsPackaging(false);
-    setPackagingStartedAt(null);
-    setRemainingSeconds(null);
+    setIsRunning(false);
+    setStartedAt(null);
+    setEtaSeconds(null);
+
     if (!response.ok || !response.data) {
       setStatusMessage(response.error ?? "Packaging failed.");
       return;
     }
-
     setWarnings(response.warnings ?? []);
     setResult(response.data);
-    if (response.data.selectedEncoder) {
-      const pipelinePart = response.data.selectedVideoPipeline
-        ? ` | Pipeline: ${response.data.selectedVideoPipeline}`
-        : "";
-      const segmentPart = response.data.effectiveSegmentDuration
-        ? ` | Segment: ${response.data.effectiveSegmentDuration}s`
-        : "";
-      const fpsPart = response.data.effectiveOutputFps ? ` | Output FPS: ${response.data.effectiveOutputFps}` : "";
-      setStatusMessage(
-        `Packaging completed. Encoder used: ${response.data.selectedEncoder}${pipelinePart}${segmentPart}${fpsPart}`
-      );
-    }
+    setStatusMessage("Packaging completed.");
 
     if (response.data.masterPlaylistPath) {
       const preview = await window.electronAPI.previewMaster(response.data.masterPlaylistPath);
-      if (preview.ok && preview.data) {
-        setMasterPreview(preview.data);
-      }
+      if (preview.ok && preview.data) setMasterPreview(preview.data);
     }
   }
 
-  async function cancelPackaging(): Promise<void> {
+  async function pickPackageFolder(): Promise<void> {
+    const selected = await window.electronAPI.pickHlsPackageFolder();
+    if (!selected) return;
+    setPackageDir(selected);
+    setScannedPackage(null);
+    setUpdateResult(null);
+    setValidationErrors([]);
+    setMasterPreview("");
+  }
+
+  async function scanPackage(): Promise<void> {
+    if (!packageDir.trim()) {
+      setValidationErrors(["Select an HLS package folder first."]);
+      return;
+    }
+    setValidationErrors([]);
+    setStatusMessage("Scanning package...");
+    const response = await window.electronAPI.scanHlsPackage(packageDir);
+    if (!response.ok || !response.data) {
+      setScannedPackage(null);
+      setStatusMessage(response.error ?? "Failed to scan package.");
+      return;
+    }
+    setScannedPackage(response.data);
+    setStatusMessage("Package scanned.");
+    const preview = await window.electronAPI.previewMaster(response.data.masterPlaylistPath);
+    if (preview.ok && preview.data) setMasterPreview(preview.data);
+  }
+
+  useEffect(() => {
+    if (workMode !== "update") return;
+    if (!packageDir.trim()) return;
+    void scanPackage();
+  }, [packageDir, workMode]);
+
+  async function addUpdateSubtitle(): Promise<void> {
+    const picked = await window.electronAPI.pickSubtitle();
+    if (!picked) return;
+    setUpdateSubtitles((prev) => [
+      ...prev,
+      {
+        id: makeId(),
+        filePath: picked,
+        name: basename(picked),
+        language: "fa",
+        isDefault: false,
+        inputFormat: subtitleFormat(picked),
+      },
+    ]);
+  }
+
+  function updateUpdateSubtitle(id: string, partial: Partial<SubtitleTrack>): void {
+    setUpdateSubtitles((prev) => prev.map((item) => (item.id === id ? { ...item, ...partial } : item)));
+  }
+
+  function removeUpdateSubtitle(id: string): void {
+    setUpdateSubtitles((prev) => prev.filter((item) => item.id !== id));
+  }
+
+  async function addUpdateAudio(): Promise<void> {
+    const picked = await window.electronAPI.pickAudio();
+    if (!picked) return;
+    setUpdateAudioTracks((prev) => [
+      ...prev,
+      {
+        id: makeId(),
+        source: "external",
+        filePath: picked,
+        name: basename(picked),
+        language: "fa",
+        type: "dubbed",
+        isDefault: false,
+        audioOffsetMs: 0,
+      },
+    ]);
+  }
+
+  function updateUpdateAudio(id: string, partial: Partial<AudioTrack>): void {
+    setUpdateAudioTracks((prev) => prev.map((item) => (item.id === id ? { ...item, ...partial } : item)));
+  }
+
+  function removeUpdateAudio(id: string): void {
+    setUpdateAudioTracks((prev) => prev.filter((item) => item.id !== id));
+  }
+
+  function validateUpdateForm(): string[] {
+    const errors: string[] = [];
+    if (!packageDir.trim()) errors.push("Select existing HLS package folder.");
+    if (!scannedPackage) errors.push("Scan the package before update.");
+    if (updateSubtitles.length === 0 && updateAudioTracks.length === 0) {
+      errors.push("Add at least one new subtitle or dubbed audio track.");
+    }
+
+    const newDefaultCount = updateAudioTracks.filter((a) => a.isDefault).length;
+    if (newDefaultCount > 1) errors.push("Only one new audio track can be set as default.");
+
+    for (const track of updateAudioTracks) {
+      if (!track.name.trim()) errors.push("New audio track name is required.");
+      if (!track.language.trim()) errors.push(`Language code is required for "${track.name || "Unnamed"}".`);
+      if (!track.filePath) errors.push(`Audio file is required for "${track.name || "Unnamed"}".`);
+    }
+    for (const sub of updateSubtitles) {
+      if (!sub.name.trim()) errors.push("New subtitle name is required.");
+      if (!sub.language.trim()) errors.push(`Language code is required for subtitle "${sub.name || "Unnamed"}".`);
+      if (!sub.filePath) errors.push(`Subtitle file is required for subtitle "${sub.name || "Unnamed"}".`);
+    }
+
+    const seenSubtitleKeys = new Set<string>();
+    const seenAudioKeys = new Set<string>();
+    const existingSubtitleKeys = new Set(
+      (scannedPackage?.parsed.subtitles ?? []).map((item) => subtitleIdentity(item.name, item.language))
+    );
+    const existingAudioKeys = new Set(
+      (scannedPackage?.parsed.audioTracks ?? []).map((item) => audioIdentity(item.name, item.language, item.type))
+    );
+
+    for (const sub of updateSubtitles) {
+      const key = subtitleIdentity(sub.name, sub.language);
+      if (seenSubtitleKeys.has(key)) {
+        errors.push(`Duplicate subtitle in update list: "${sub.name}" (${sub.language}).`);
+      }
+      if (existingSubtitleKeys.has(key)) {
+        errors.push(`Subtitle already exists in package: "${sub.name}" (${sub.language}).`);
+      }
+      seenSubtitleKeys.add(key);
+    }
+
+    for (const track of updateAudioTracks) {
+      const key = audioIdentity(track.name, track.language, track.type);
+      if (seenAudioKeys.has(key)) {
+        errors.push(`Duplicate audio track in update list: "${track.name}" (${track.language}, ${track.type}).`);
+      }
+      if (existingAudioKeys.has(key)) {
+        errors.push(`Audio track already exists in package: "${track.name}" (${track.language}, ${track.type}).`);
+      }
+      seenAudioKeys.add(key);
+    }
+
+    return errors;
+  }
+
+  async function startPackageUpdate(): Promise<void> {
+    if (isRunning) return;
+    const errors = validateUpdateForm();
+    if (errors.length > 0) {
+      setValidationErrors(errors);
+      setStatusMessage("Please fix validation errors.");
+      return;
+    }
+
+    setValidationErrors([]);
+    setWarnings([]);
+    setUpdateResult(null);
+    setMasterPreview("");
+    setLogs([]);
+    setShowLogs(true);
+    setStartedAt(Date.now());
+    setElapsedSeconds(0);
+    setEtaSeconds(null);
+    setMaxProgressSeen(0);
+    setIsRunning(true);
+    setStatusMessage("Starting package update...");
+
+    const job: PackageUpdateJob = {
+      packageDir,
+      newSubtitles: updateSubtitles,
+      newAudioTracks: updateAudioTracks,
+      segmentDuration: scannedPackage?.segmentDuration,
+      audioMode,
+      parallelAudioProcessing,
+      ffmpegPathOverride: ffmpegPath.trim() || undefined,
+      ffprobePathOverride: ffprobePath.trim() || undefined,
+    };
+
+    const response = await window.electronAPI.startPackageUpdate(job);
+    setIsRunning(false);
+    setStartedAt(null);
+    setEtaSeconds(null);
+
+    if (!response.ok || !response.data) {
+      setStatusMessage(response.error ?? "Package update failed.");
+      return;
+    }
+
+    setWarnings(response.warnings ?? []);
+    setUpdateResult(response.data);
+    setStatusMessage("Package update completed.");
+    if (response.data.masterPlaylistPath) {
+      const preview = await window.electronAPI.previewMaster(response.data.masterPlaylistPath);
+      if (preview.ok && preview.data) setMasterPreview(preview.data);
+    }
+    await scanPackage();
+  }
+
+  async function cancelRun(): Promise<void> {
     await window.electronAPI.cancelPackaging();
-    setIsPackaging(false);
-    setPackagingStartedAt(null);
-    setRemainingSeconds(null);
+    setIsRunning(false);
+    setStartedAt(null);
+    setEtaSeconds(null);
     setStatusMessage("Cancel requested...");
   }
 
   async function autoDetectBinaries(): Promise<void> {
-    const check = await window.electronAPI.resolveBinaries(ffmpegPath || undefined, ffprobePath || undefined);
+    const check = await window.electronAPI.resolveBinaries(ffmpegPath.trim() || undefined, ffprobePath.trim() || undefined);
     if (!check.ok || !check.data) {
-      setStatusMessage(check.error ?? "Failed to resolve ffmpeg/ffprobe.");
+      setStatusMessage(check.error ?? "Failed to resolve binaries.");
       return;
     }
     setFfmpegPath(check.data.ffmpegPath);
     setFfprobePath(check.data.ffprobePath);
     setWarnings(check.warnings ?? []);
+
     const encoderCheck = await window.electronAPI.detectEncoders(check.data.ffmpegPath);
     if (encoderCheck.ok && encoderCheck.data) {
-      const capabilityParts: string[] = [];
-      capabilityParts.push(encoderCheck.data.capabilities.nvidiaNvenc ? "NVENC" : "NVENC unavailable");
-      capabilityParts.push(encoderCheck.data.capabilities.intelQsv ? "QSV" : "QSV unavailable");
-      capabilityParts.push(encoderCheck.data.capabilities.amdAmf ? "AMF" : "AMF unavailable");
-      capabilityParts.push(`Auto picks: ${encoderCheck.data.preferredEncoder}`);
+      const capabilityParts = [
+        encoderCheck.data.capabilities.nvidiaNvenc ? "NVENC" : "NVENC unavailable",
+        encoderCheck.data.capabilities.intelQsv ? "QSV" : "QSV unavailable",
+        encoderCheck.data.capabilities.amdAmf ? "AMF" : "AMF unavailable",
+        `Auto picks: ${encoderCheck.data.preferredEncoder}`,
+      ];
       setEncoderStatus(capabilityParts.join(" | "));
     } else {
       setEncoderStatus(encoderCheck.error ?? "Encoder detection failed.");
@@ -701,554 +802,586 @@ export default function App() {
   }
 
   async function openOutputFolder(): Promise<void> {
-    if (!result?.outputDir) return;
-    await window.electronAPI.openFolder(result.outputDir);
+    if (result?.outputDir) await window.electronAPI.openFolder(result.outputDir);
+  }
+
+  async function openUpdatedPackageFolder(): Promise<void> {
+    if (updateResult?.packageDir) await window.electronAPI.openFolder(updateResult.packageDir);
   }
 
   async function copyMasterPath(): Promise<void> {
     if (!result?.masterPlaylistPath) return;
     await window.electronAPI.copyToClipboard(result.masterPlaylistPath);
-    setStatusMessage("Master path copied to clipboard.");
+    setStatusMessage("Master path copied.");
   }
 
   async function playInVlc(): Promise<void> {
     if (!result?.masterPlaylistPath) return;
     const launch = await window.electronAPI.launchVlc(result.masterPlaylistPath);
-    if (!launch.ok) {
-      setStatusMessage(launch.error ?? "Could not launch VLC.");
-    }
+    if (!launch.ok) setStatusMessage(launch.error ?? "Could not launch VLC.");
   }
-
-  const safeProgress = Math.min(100, Math.max(0, progress.percent));
-  const etaSeconds = isPackaging ? remainingSeconds : null;
 
   return (
     <div className="app-shell">
       <header className="hero">
         <div>
           <h1>HLS Media Packager</h1>
-          <p>Package MP4 + multi-audio + subtitles into a complete HLS VOD output.</p>
+          <p>Create and update HLS packages for movies and series.</p>
         </div>
-        <div className="status-pill">{statusMessage}</div>
+        <div className="status-pill" role="status" aria-live="polite">
+          {statusMessage}
+        </div>
       </header>
 
-      <div className="toolbar" style={{ marginBottom: 12 }}>
+      <nav className="mode-switch" aria-label="Work mode">
         <button
-          className="secondary"
-          onClick={clearAll}
-          disabled={isPackaging}
-          title={isPackaging ? "Cancel packaging first" : "Clear all job fields"}
+          type="button"
+          className={workMode === "package" ? "primary" : "secondary"}
+          disabled={isRunning}
+          onClick={() => setWorkMode("package")}
         >
+          New Package
+        </button>
+        <button
+          type="button"
+          className={workMode === "update" ? "primary" : "secondary"}
+          disabled={isRunning}
+          onClick={() => setWorkMode("update")}
+        >
+          Update Existing Package
+        </button>
+        <button type="button" className="secondary" disabled={isRunning} onClick={clearAll}>
           Clear
         </button>
-      </div>
+      </nav>
 
       {validationErrors.length > 0 && (
-        <section className="alert error">
+        <section className="alert error" role="alert">
           <strong>Validation errors</strong>
-          {validationErrors.map((item) => (
-            <div key={item}>{item}</div>
-          ))}
+          <ul>
+            {validationErrors.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
         </section>
       )}
 
       {warnings.length > 0 && (
-        <section className="alert warning">
+        <section className="alert warning" role="status">
           <strong>Warnings</strong>
-          {warnings.map((item) => (
-            <div key={item}>{item}</div>
-          ))}
+          <ul>
+            {warnings.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
         </section>
       )}
 
       <section className="grid">
-        <article className="card">
-          <h2>A. Input Video</h2>
-          <div className="inline">
-            <input value={videoPath} readOnly placeholder="Select input video file" />
-            <button onClick={pickVideo}>Select Video</button>
-          </div>
-          {videoInfo && (
-            <div className="meta-row">
-              <span>Duration: {Math.round(videoInfo.durationSeconds)}s</span>
-              <span>
-                Resolution: {videoInfo.width}x{videoInfo.height}
-              </span>
-              <span>Frame rate: {videoInfo.frameRate > 0 ? `${videoInfo.frameRate.toFixed(3)} fps` : "unknown"}</span>
-              <span>Video codec: {videoInfo.videoCodec}</span>
-              <span>
-                Source bitrate:{" "}
-                {videoInfo.videoBitrateKbps || videoInfo.formatBitrateKbps
-                  ? `${videoInfo.videoBitrateKbps ?? videoInfo.formatBitrateKbps} kbps`
-                  : "unknown"}
-              </span>
-              <span>Audio streams: {videoInfo.audioStreamCount}</span>
-            </div>
-          )}
-        </article>
+        {workMode === "package" ? (
+          <>
+            <article className="card">
+              <h2>Input Video</h2>
+              <div className="inline">
+                <input value={videoPath} readOnly placeholder="Select input video file" aria-label="Selected input video" />
+                <button type="button" onClick={pickVideo}>
+                  Select Video
+                </button>
+              </div>
+              {videoInfo && (
+                <div className="meta-row">
+                  <span>Duration: {Math.round(videoInfo.durationSeconds)}s</span>
+                  <span>
+                    Resolution: {videoInfo.width}x{videoInfo.height}
+                  </span>
+                  <span>Frame Rate: {videoInfo.frameRate > 0 ? `${videoInfo.frameRate.toFixed(3)} fps` : "unknown"}</span>
+                  <span>Codec: {videoInfo.videoCodec}</span>
+                  <span>Audio Streams: {videoInfo.audioStreamCount}</span>
+                </div>
+              )}
+            </article>
 
-        <article className="card">
-          <h2>A1. Content Mode</h2>
-          <div className="inline wrap">
-            <label>
-              Content Type
-              <select value={contentType} onChange={(event) => setContentType(event.target.value as ContentType)}>
-                <option value="movie">Movie / Single Video</option>
-                <option value="series">Series Episode</option>
-              </select>
-            </label>
-            {contentType === "movie" && (
-              <label className="grow">
-                Movie Title (Optional)
-                <input
-                  value={movieTitle}
-                  onChange={(event) => setMovieTitle(event.target.value)}
-                  placeholder="Folder name override"
-                />
-              </label>
-            )}
-            {contentType === "series" && (
-              <>
-                <label className="grow">
-                  Series Title
-                  <input
-                    value={seriesTitle}
-                    onChange={(event) => setSeriesTitle(event.target.value)}
-                    placeholder="My Series Name"
-                  />
-                </label>
+            <article className="card">
+              <h2>Content</h2>
+              <div className="inline wrap">
                 <label>
-                  Season
-                  <input
-                    type="number"
-                    min={1}
-                    value={seasonNumber}
-                    onChange={(event) => setSeasonNumber(Number.parseInt(event.target.value, 10) || 0)}
-                  />
+                  Content Type
+                  <select value={contentType} onChange={(event) => setContentType(event.target.value as ContentType)}>
+                    <option value="movie">Movie</option>
+                    <option value="series">Series Episode</option>
+                  </select>
                 </label>
-                <label>
-                  Episode
-                  <input
-                    type="number"
-                    min={1}
-                    value={episodeNumber}
-                    onChange={(event) => setEpisodeNumber(Number.parseInt(event.target.value, 10) || 0)}
-                  />
-                </label>
-              </>
-            )}
-          </div>
-          {contentType === "series" && (
-            <div className="inline wrap">
-              <label className="grow">
-                Episode Title (Optional)
-                <input
-                  value={episodeTitle}
-                  onChange={(event) => setEpisodeTitle(event.target.value)}
-                  placeholder="Pilot"
-                />
-              </label>
-            </div>
-          )}
-          <p className="muted">
-            Series mode creates folders automatically as: <strong>date / series / season / episode</strong>.
-          </p>
-        </article>
-
-        <article className="card">
-          <h2>B. Audio Tracks</h2>
-          <div className="inline">
-            <button onClick={addExternalAudio}>Add Audio Track</button>
-            <button onClick={addOriginalAudio}>Use Original Audio From Video</button>
-          </div>
-          <div className="stack">
-            {audioTracks.map((track) => (
-              <div key={track.id} className="subcard">
-                <div className="inline wrap">
+                {contentType === "movie" && (
                   <label className="grow">
-                    Source
-                    <input value={track.source === "external" ? "external file" : "video original"} readOnly />
+                    Movie Title
+                    <input value={movieTitle} onChange={(event) => setMovieTitle(event.target.value)} placeholder="Sinners" required />
                   </label>
-                  {track.source === "external" && (
-                    <>
+                )}
+                {contentType === "series" && (
+                  <>
+                    <label className="grow">
+                      Series Title
+                      <input value={seriesTitle} onChange={(event) => setSeriesTitle(event.target.value)} />
+                    </label>
+                    <label>
+                      Season
+                      <input type="number" min={1} value={seasonNumber} onChange={(e) => setSeasonNumber(Number.parseInt(e.target.value, 10) || 0)} />
+                    </label>
+                    <label>
+                      Episode
+                      <input type="number" min={1} value={episodeNumber} onChange={(e) => setEpisodeNumber(Number.parseInt(e.target.value, 10) || 0)} />
+                    </label>
+                  </>
+                )}
+              </div>
+              {contentType === "series" && (
+                <label className="grow">
+                  Episode Title (Optional)
+                  <input value={episodeTitle} onChange={(event) => setEpisodeTitle(event.target.value)} />
+                </label>
+              )}
+            </article>
+
+            <article className="card">
+              <h2>Audio Tracks</h2>
+              <div className="inline">
+                <button type="button" onClick={addExternalAudio}>
+                  Add External Audio
+                </button>
+                <button type="button" onClick={addOriginalAudio}>
+                  Use Original Audio
+                </button>
+              </div>
+              <div className="stack">
+                {audioTracks.map((track) => (
+                  <div key={track.id} className="subcard">
+                    <div className="inline wrap">
                       <label className="grow">
-                        File
-                        <input value={track.filePath ?? ""} readOnly />
+                        Name
+                        <input value={track.name} onChange={(e) => updateAudioTrack(track.id, { name: e.target.value })} />
                       </label>
+                      <label>
+                        Language
+                        <input value={track.language} onChange={(e) => updateAudioTrack(track.id, { language: e.target.value })} />
+                      </label>
+                      <label>
+                        Type
+                        <select value={track.type} onChange={(e) => updateAudioTrack(track.id, { type: e.target.value as AudioTrack["type"] })}>
+                          <option value="dubbed">dubbed</option>
+                          <option value="original">original</option>
+                          <option value="commentary">commentary</option>
+                        </select>
+                      </label>
+                      <label>
+                        Offset (ms)
+                        <input
+                          type="number"
+                          step={100}
+                          value={track.audioOffsetMs ?? 0}
+                          onChange={(e) => updateAudioTrack(track.id, { audioOffsetMs: Number.parseInt(e.target.value, 10) || 0 })}
+                        />
+                      </label>
+                    </div>
+                    <div className="inline wrap">
+                      <label className="toggle">
+                        <input type="checkbox" checked={track.isDefault} onChange={(e) => setDefaultAudio(track.id, e.target.checked)} />
+                        Default
+                      </label>
+                      {track.source === "external" && (
+                        <>
+                          <input value={track.filePath ?? ""} readOnly aria-label="Audio file path" />
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const selected = await window.electronAPI.pickAudio();
+                              if (selected) updateAudioTrack(track.id, { filePath: selected });
+                            }}
+                          >
+                            Pick File
+                          </button>
+                        </>
+                      )}
+                      <button type="button" className="danger" onClick={() => removeAudioTrack(track.id)}>
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {audioTracks.length === 0 && <p className="muted">No audio tracks added yet.</p>}
+              </div>
+            </article>
+
+            <article className="card">
+              <h2>Subtitles</h2>
+              <button type="button" onClick={addSubtitle}>
+                Add Subtitle
+              </button>
+              <div className="stack">
+                {subtitles.map((sub) => (
+                  <div key={sub.id} className="subcard">
+                    <div className="inline wrap">
+                      <label className="grow">
+                        Name
+                        <input value={sub.name} onChange={(e) => updateSubtitle(sub.id, { name: e.target.value })} />
+                      </label>
+                      <label>
+                        Language
+                        <input value={sub.language} onChange={(e) => updateSubtitle(sub.id, { language: e.target.value })} />
+                      </label>
+                      <label className="toggle">
+                        <input type="checkbox" checked={sub.isDefault} onChange={(e) => setDefaultSubtitle(sub.id, e.target.checked)} />
+                        Default
+                      </label>
+                    </div>
+                    <div className="inline wrap">
+                      <input value={sub.filePath} readOnly aria-label="Subtitle file path" />
+                      <input value={sub.inputFormat.toUpperCase()} readOnly aria-label="Subtitle format" />
                       <button
+                        type="button"
                         onClick={async () => {
-                          const selected = await window.electronAPI.pickAudio();
-                          if (selected) updateAudioTrack(track.id, { filePath: selected });
+                          const picked = await window.electronAPI.pickSubtitle();
+                          if (picked) updateSubtitle(sub.id, { filePath: picked, inputFormat: subtitleFormat(picked) });
                         }}
                       >
                         Pick File
                       </button>
-                    </>
-                  )}
-                </div>
-
-                <div className="inline wrap">
-                  <label className="grow">
-                    Display Name
-                    <input
-                      value={track.name}
-                      onChange={(event) => updateAudioTrack(track.id, { name: event.target.value })}
-                      placeholder="دوبله فارسی"
-                    />
-                  </label>
-                  <label>
-                    Language
-                    <input
-                      value={track.language}
-                      onChange={(event) => updateAudioTrack(track.id, { language: event.target.value })}
-                      placeholder="fa"
-                    />
-                  </label>
-                  <label>
-                    Type
-                    <select
-                      value={track.type}
-                      onChange={(event) => updateAudioTrack(track.id, { type: event.target.value as AudioTrack["type"] })}
-                    >
-                      <option value="dubbed">dubbed</option>
-                      <option value="original">original</option>
-                      <option value="commentary">commentary</option>
-                    </select>
-                  </label>
-                  <label className="toggle">
-                    <input
-                      type="checkbox"
-                      checked={track.isDefault}
-                      onChange={(event) => setDefaultAudio(track.id, event.target.checked)}
-                    />
-                    Default
-                  </label>
-                  <button className="danger" onClick={() => removeAudioTrack(track.id)}>
-                    Remove
-                  </button>
-                </div>
+                      <button type="button" className="danger" onClick={() => removeSubtitle(sub.id)}>
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {subtitles.length === 0 && <p className="muted">No subtitles added yet.</p>}
               </div>
-            ))}
-            {audioTracks.length === 0 && <p className="muted">No audio tracks added.</p>}
-          </div>
-        </article>
+            </article>
 
-        <article className="card">
-          <h2>C. Subtitles</h2>
-          <button onClick={addSubtitle}>Add Subtitle</button>
-          <div className="stack">
-            {subtitles.map((subtitle) => (
-              <div key={subtitle.id} className="subcard">
-                <div className="inline wrap">
-                  <label className="grow">
-                    File
-                    <input value={subtitle.filePath} readOnly />
-                  </label>
-                  <label>
-                    Format
-                    <input value={subtitle.inputFormat.toUpperCase()} readOnly />
-                  </label>
-                  <button
-                    onClick={async () => {
-                      const picked = await window.electronAPI.pickSubtitle();
-                      if (picked) {
-                        updateSubtitle(subtitle.id, { filePath: picked, inputFormat: subtitleFormat(picked) });
-                      }
-                    }}
-                  >
-                    Pick File
-                  </button>
-                </div>
-
-                <div className="inline wrap">
-                  <label className="grow">
-                    Subtitle Name
-                    <input
-                      value={subtitle.name}
-                      onChange={(event) => updateSubtitle(subtitle.id, { name: event.target.value })}
-                      placeholder="Persian Subtitle"
-                    />
-                  </label>
-                  <label>
-                    Language
-                    <input
-                      value={subtitle.language}
-                      onChange={(event) => updateSubtitle(subtitle.id, { language: event.target.value })}
-                      placeholder="fa"
-                    />
-                  </label>
-                  <label className="toggle">
-                    <input
-                      type="checkbox"
-                      checked={subtitle.isDefault}
-                      onChange={(event) => setDefaultSubtitle(subtitle.id, event.target.checked)}
-                    />
-                    Default
-                  </label>
-                  <button className="danger" onClick={() => removeSubtitle(subtitle.id)}>
-                    Remove
-                  </button>
-                </div>
+            <article className="card">
+              <h2>Quality Ladder</h2>
+              <div className="inline">
+                <button type="button" onClick={() => applyLadderPreset("high")}>
+                  High
+                </button>
+                <button type="button" onClick={() => applyLadderPreset("balanced")}>
+                  Balanced
+                </button>
+                <button type="button" onClick={() => applyLadderPreset("low")}>
+                  Low Size
+                </button>
               </div>
-            ))}
-            {subtitles.length === 0 && <p className="muted">No subtitles added.</p>}
-          </div>
-        </article>
+              <table className="quality-table">
+                <thead>
+                  <tr>
+                    <th>Enable</th>
+                    <th>Quality</th>
+                    <th>Resolution</th>
+                    <th>Bitrate (k)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {qualities
+                    .slice()
+                    .sort((a, b) => b.height - a.height)
+                    .map((q) => {
+                      const disabledBySource = !!videoInfo && requiresUpscale(videoInfo.width, videoInfo.height, q.width, q.height);
+                      return (
+                        <tr key={q.key}>
+                          <td>
+                            <input type="checkbox" checked={q.enabled} disabled={disabledBySource} onChange={(e) => updateQuality(q.key, { enabled: e.target.checked })} />
+                          </td>
+                          <td>{q.label}</td>
+                          <td>
+                            {q.width}x{q.height}
+                          </td>
+                          <td>
+                            <input
+                              type="number"
+                              min={100}
+                              step={50}
+                              value={q.bitrateKbps}
+                              onChange={(e) => updateQuality(q.key, { bitrateKbps: Number.parseInt(e.target.value, 10) || 0 })}
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </article>
 
-        <article className="card">
-          <h2>D. Quality Ladder</h2>
-          <div className="inline">
-            <button onClick={() => applyLadderPreset("high")}>High quality</button>
-            <button onClick={() => applyLadderPreset("balanced")}>Balanced</button>
-            <button onClick={() => applyLadderPreset("low")}>Low size</button>
-          </div>
-          <table className="quality-table">
-            <thead>
-              <tr>
-                <th>Enable</th>
-                <th>Quality</th>
-                <th>Resolution</th>
-                <th>Bitrate (k)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {qualities
-                .slice()
-                .sort((a, b) => b.height - a.height)
-                .map((quality) => {
-                  const disabledBySource =
-                    !!videoInfo &&
-                    requiresUpscale(videoInfo.width, videoInfo.height, quality.width, quality.height);
-                  return (
-                    <tr key={quality.key}>
-                      <td>
-                        <input
-                          type="checkbox"
-                          checked={quality.enabled}
-                          disabled={disabledBySource}
-                          onChange={(event) => updateQuality(quality.key, { enabled: event.target.checked })}
-                        />
-                      </td>
-                      <td>{quality.label}</td>
-                      <td>
-                        {quality.width}x{quality.height}
-                      </td>
-                      <td>
+            <article className="card">
+              <h2>Output</h2>
+              <div className="inline">
+                <input value={outputDir} readOnly placeholder="Select output folder" />
+                <button type="button" onClick={pickOutputFolder}>
+                  Select Folder
+                </button>
+              </div>
+              <label className="toggle">
+                <input type="checkbox" checked={allowOverwrite} onChange={(e) => setAllowOverwrite(e.target.checked)} />
+                Allow overwrite for non-empty output folder
+              </label>
+              <pre className="tree">{outputPreview}</pre>
+            </article>
+          </>
+        ) : (
+          <>
+            <article className="card">
+              <h2>Existing HLS Package</h2>
+              <div className="inline">
+                <input value={packageDir} readOnly placeholder="Select folder containing master.m3u8" />
+                <button type="button" onClick={pickPackageFolder}>
+                  Select Folder
+                </button>
+              </div>
+              {scannedPackage && (
+                <>
+                  <div className="meta-row">
+                    <span>Variants: {scannedPackage.parsed.videoVariants.length}</span>
+                    <span>Audio: {scannedPackage.parsed.audioTracks.length}</span>
+                    <span>Subtitles: {scannedPackage.parsed.subtitles.length}</span>
+                    <span>Segment: {scannedPackage.segmentDuration}s</span>
+                    <span>Duration: {Math.round(scannedPackage.durationSeconds)}s</span>
+                  </div>
+                  <pre className="tree">{masterPreview || "No preview loaded yet."}</pre>
+                </>
+              )}
+            </article>
+
+            <article className="card">
+              <h2>New Subtitles</h2>
+              <button type="button" onClick={addUpdateSubtitle}>
+                Add Subtitle
+              </button>
+              <div className="stack">
+                {updateSubtitles.map((sub) => (
+                  <div key={sub.id} className="subcard">
+                    <div className="inline wrap">
+                      <label className="grow">
+                        Name
+                        <input value={sub.name} onChange={(e) => updateUpdateSubtitle(sub.id, { name: e.target.value })} />
+                      </label>
+                      <label>
+                        Language
+                        <input value={sub.language} onChange={(e) => updateUpdateSubtitle(sub.id, { language: e.target.value })} />
+                      </label>
+                    </div>
+                    <div className="inline wrap">
+                      <input value={sub.filePath} readOnly />
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const picked = await window.electronAPI.pickSubtitle();
+                          if (picked) updateUpdateSubtitle(sub.id, { filePath: picked, inputFormat: subtitleFormat(picked) });
+                        }}
+                      >
+                        Pick File
+                      </button>
+                      <button type="button" className="danger" onClick={() => removeUpdateSubtitle(sub.id)}>
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {updateSubtitles.length === 0 && <p className="muted">No new subtitles added yet.</p>}
+              </div>
+            </article>
+
+            <article className="card">
+              <h2>New Dubbed Audio</h2>
+              <button type="button" onClick={addUpdateAudio}>
+                Add Dubbed Audio
+              </button>
+              <div className="stack">
+                {updateAudioTracks.map((track) => (
+                  <div key={track.id} className="subcard">
+                    <div className="inline wrap">
+                      <label className="grow">
+                        Name
+                        <input value={track.name} onChange={(e) => updateUpdateAudio(track.id, { name: e.target.value })} />
+                      </label>
+                      <label>
+                        Language
+                        <input value={track.language} onChange={(e) => updateUpdateAudio(track.id, { language: e.target.value })} />
+                      </label>
+                      <label>
+                        Offset (ms)
                         <input
                           type="number"
-                          min={100}
-                          step={50}
-                          value={quality.bitrateKbps}
-                          onChange={(event) =>
-                            updateQuality(quality.key, { bitrateKbps: Number.parseInt(event.target.value, 10) || 0 })
-                          }
+                          step={100}
+                          value={track.audioOffsetMs ?? 0}
+                          onChange={(e) => updateUpdateAudio(track.id, { audioOffsetMs: Number.parseInt(e.target.value, 10) || 0 })}
                         />
-                      </td>
-                    </tr>
-                  );
-                })}
-            </tbody>
-          </table>
-          {videoInfo && (
-            <p className="muted">
-              Qualities above source resolution ({videoInfo.width}x{videoInfo.height}) are disabled automatically.
-            </p>
-          )}
-        </article>
+                      </label>
+                      <label className="toggle">
+                        <input
+                          type="checkbox"
+                          checked={track.isDefault}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setUpdateAudioTracks((prev) =>
+                              prev.map((item) => {
+                                if (item.id === track.id) return { ...item, isDefault: checked };
+                                return checked ? { ...item, isDefault: false } : item;
+                              })
+                            );
+                          }}
+                        />
+                        Default
+                      </label>
+                    </div>
+                    <div className="inline wrap">
+                      <input value={track.filePath ?? ""} readOnly />
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const selected = await window.electronAPI.pickAudio();
+                          if (selected) updateUpdateAudio(track.id, { filePath: selected });
+                        }}
+                      >
+                        Pick File
+                      </button>
+                      <button type="button" className="danger" onClick={() => removeUpdateAudio(track.id)}>
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {updateAudioTracks.length === 0 && <p className="muted">No new dubbed audio added yet.</p>}
+              </div>
+            </article>
+          </>
+        )}
 
         <article className="card">
-          <h2>E. Output</h2>
+          <h2>{workMode === "update" ? "Update & Sync" : "Run Packaging"}</h2>
           <div className="inline">
-            <input value={outputDir} readOnly placeholder="Select output folder" />
-            <button onClick={pickOutputFolder}>Select Folder</button>
-          </div>
-          <p className="muted">Final output folder is auto-created inside selected base directory.</p>
-          <pre className="tree">{outputPreview}</pre>
-        </article>
-
-        <article className="card">
-          <h2>F. Packaging</h2>
-          <div className="inline">
-            <button className="primary final-start" disabled={isPackaging} onClick={startPackaging}>
-              START
+            <button type="button" className="primary final-start" disabled={isRunning} onClick={workMode === "update" ? startPackageUpdate : startPackaging}>
+              {workMode === "update" ? "Update & Sync" : "Start Packaging"}
             </button>
-            <button disabled={!isPackaging} onClick={cancelPackaging}>
+            <button type="button" disabled={!isRunning} onClick={cancelRun}>
               Cancel
             </button>
           </div>
-          <div className="progress-wrap">
+          <div className="progress-wrap" aria-label="Task progress">
             <div className="progress-bar" style={{ width: `${safeProgress}%` }} />
           </div>
           <p className="muted">
             Step: <strong>{progress.step}</strong> | {progress.message}
           </p>
-          <p className="muted timing-row">
-            Elapsed: <strong>{formatClock(elapsedSeconds)}</strong>
+          <p className="muted">
+            Elapsed: <strong>{formatClock(elapsedSeconds)}</strong> | ETA: <strong>{etaSeconds === null ? "--:--" : formatClock(etaSeconds)}</strong>
           </p>
 
-          <details open={showCommand} onToggle={(event) => setShowCommand(event.currentTarget.open)}>
+          <details open={showCommand} onToggle={(e) => setShowCommand(e.currentTarget.open)}>
             <summary>Current FFmpeg Command</summary>
             <pre className="log">{currentCommand || "No command yet."}</pre>
           </details>
-
-          <details open={showLogs} onToggle={(event) => setShowLogs(event.currentTarget.open)}>
-            <summary>FFmpeg Logs ({deferredLogs.length})</summary>
+          <details open={showLogs} onToggle={(e) => setShowLogs(e.currentTarget.open)}>
+            <summary>Logs ({deferredLogs.length})</summary>
             <pre className="log">{deferredLogs.join("\n") || "No logs yet."}</pre>
           </details>
 
-          {result?.success && (
+          {workMode === "package" && result?.success && (
             <div className="result-box">
-              <p>Packaging complete.</p>
+              <p>Packaging completed successfully.</p>
               <div className="inline wrap">
-                <button onClick={openOutputFolder}>Open Output Folder</button>
-                <button
-                  onClick={async () => {
-                    if (result.masterPlaylistPath) {
-                      const preview = await window.electronAPI.previewMaster(result.masterPlaylistPath);
-                      if (preview.ok && preview.data) {
-                        setMasterPreview(preview.data);
-                        setStatusMessage("Loaded master.m3u8 preview.");
-                      }
-                    }
-                  }}
-                >
-                  Preview master.m3u8
+                <button type="button" onClick={openOutputFolder}>
+                  Open Output Folder
                 </button>
-                <button onClick={copyMasterPath}>Copy Master Path</button>
-                <button onClick={playInVlc} disabled={!vlcAvailable}>
+                <button type="button" onClick={copyMasterPath}>
+                  Copy Master Path
+                </button>
+                <button type="button" onClick={playInVlc} disabled={!vlcAvailable}>
                   Test in VLC
-                </button>
-                <button
-                  onClick={async () => {
-                    if (result.metadataPath) {
-                      await window.electronAPI.showInFolder(result.metadataPath);
-                    }
-                  }}
-                >
-                  Save metadata.json
                 </button>
               </div>
             </div>
           )}
 
-          {masterPreview && (
-            <div>
-              <h3>Generated master.m3u8</h3>
-              <pre className="log">{masterPreview}</pre>
+          {workMode === "update" && updateResult?.success && (
+            <div className="result-box">
+              <p>Package updated successfully.</p>
+              <p className="muted">
+                Added {updateResult.addedSubtitles.length} subtitle(s) and {updateResult.addedAudioTracks.length} audio track(s).
+              </p>
+              <button type="button" onClick={openUpdatedPackageFolder}>
+                Open Package Folder
+              </button>
             </div>
           )}
         </article>
 
         <article className="card">
-          <h2>G. Settings</h2>
-          <h3>Speed / Performance</h3>
-          <div className="inline wrap">
-            <label>
-              Mode
-              <select
-                value={performanceMode}
-                onChange={(event) =>
-                  setPerformanceMode(event.target.value as typeof performanceMode)
-                }
-              >
-                <option value="fast">Fast</option>
-                <option value="balanced">Balanced</option>
-                <option value="quality">Quality</option>
-              </select>
-            </label>
-            <label>
-              Encoder
-              <select
-                value={encoderPreference}
-                onChange={(event) =>
-                  setEncoderPreference(event.target.value as typeof encoderPreference)
-                }
-              >
-                <option value="auto">Auto (Recommended)</option>
-                <option value="nvidia">NVIDIA NVENC (h264_nvenc)</option>
-                <option value="intel">Intel QSV (h264_qsv)</option>
-                <option value="amd">AMD AMF (h264_amf)</option>
-                <option value="cpu">CPU libx264</option>
-              </select>
-            </label>
-            <label>
-              Audio Mode
-              <select
-                value={audioMode}
-                onChange={(event) =>
-                  setAudioMode(event.target.value as typeof audioMode)
-                }
-              >
-                <option value="copy-when-possible">Copy AAC when possible</option>
-                <option value="encode-aac">Always encode AAC</option>
-              </select>
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={parallelAudioProcessing}
-                onChange={(event) => setParallelAudioProcessing(event.target.checked)}
-              />
-              Parallel audio processing
-            </label>
-          </div>
-          <p className="muted">Encoder status: {encoderStatus}</p>
+          <h2>Settings</h2>
+          <fieldset>
+            <legend>Encoding</legend>
+            <div className="inline wrap">
+              <label>
+                Mode
+                <select value={performanceMode} onChange={(e) => setPerformanceMode(e.target.value as typeof performanceMode)}>
+                  <option value="fast">Fast</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="quality">Quality</option>
+                </select>
+              </label>
+              <label>
+                Encoder
+                <select value={encoderPreference} onChange={(e) => setEncoderPreference(e.target.value as typeof encoderPreference)}>
+                  <option value="auto">Auto (Recommended)</option>
+                  <option value="nvidia">NVIDIA NVENC</option>
+                  <option value="intel">Intel QSV</option>
+                  <option value="amd">AMD AMF</option>
+                  <option value="cpu">CPU libx264</option>
+                </select>
+              </label>
+              <label>
+                Audio Mode
+                <select value={audioMode} onChange={(e) => setAudioMode(e.target.value as typeof audioMode)}>
+                  <option value="copy-when-possible">Copy AAC when possible</option>
+                  <option value="encode-aac">Always encode AAC</option>
+                </select>
+              </label>
+              <label>
+                Segment Duration (sec)
+                <input type="number" min={1} step={0.5} value={segmentDuration} onChange={(e) => setSegmentDuration(Number.parseFloat(e.target.value) || 0)} />
+              </label>
+              <label className="toggle">
+                <input type="checkbox" checked={parallelAudioProcessing} onChange={(e) => setParallelAudioProcessing(e.target.checked)} />
+                Parallel audio processing
+              </label>
+              <label className="toggle">
+                <input type="checkbox" checked={useHardwareAcceleration} onChange={(e) => setUseHardwareAcceleration(e.target.checked)} />
+                Use hardware acceleration
+              </label>
+              <label>
+                Theme
+                <select value={theme} onChange={(e) => setTheme(e.target.value as AppSettings["theme"])}>
+                  <option value="light">Light</option>
+                  <option value="dark">Dark</option>
+                </select>
+              </label>
+            </div>
+          </fieldset>
 
-          <div className="inline wrap">
-            <label className="grow">
-              FFmpeg Path
-              <input
-                value={ffmpegPath}
-                onChange={(event) => setFfmpegPath(event.target.value)}
-                placeholder="Auto-detected if empty"
-              />
-            </label>
-            <label className="grow">
-              FFprobe Path
-              <input
-                value={ffprobePath}
-                onChange={(event) => setFfprobePath(event.target.value)}
-                placeholder="Auto-detected if empty"
-              />
-            </label>
-          </div>
-          <div className="inline wrap">
-            <label>
-              Segment Duration (sec)
-              <input
-                type="number"
-                min={1}
-                step={0.5}
-                value={segmentDuration}
-                onChange={(event) => setSegmentDuration(Number.parseFloat(event.target.value) || 0)}
-              />
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={useHardwareAcceleration}
-                onChange={(event) => setUseHardwareAcceleration(event.target.checked)}
-              />
-              Use Hardware Acceleration
-            </label>
-            <label>
-              Theme
-              <select value={theme} onChange={(event) => setTheme(event.target.value as AppSettings["theme"])}>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-              </select>
-            </label>
-            <button onClick={autoDetectBinaries}>Auto Detect FFmpeg</button>
-          </div>
-
-          <div className="result-box">
-            <strong>Speed Tips</strong>
-            <p className="muted">Use GPU encoder for fastest speed.</p>
-            <p className="muted">Disable 1080p if source is below 1080p.</p>
-            <p className="muted">Use 720p/480p/360p for faster output.</p>
-            <p className="muted">Use AAC copy when possible.</p>
-            <p className="muted">Use Fast mode for daily media publishing.</p>
-          </div>
+          <fieldset>
+            <legend>Binary Paths</legend>
+            <div className="inline wrap">
+              <label className="grow">
+                FFmpeg Path
+                <input value={ffmpegPath} onChange={(e) => setFfmpegPath(e.target.value)} placeholder="Auto-detected if empty" />
+              </label>
+              <label className="grow">
+                FFprobe Path
+                <input value={ffprobePath} onChange={(e) => setFfprobePath(e.target.value)} placeholder="Auto-detected if empty" />
+              </label>
+            </div>
+            <div className="inline wrap">
+              <button type="button" onClick={autoDetectBinaries}>
+                Auto Detect FFmpeg
+              </button>
+              <p className="muted">{encoderStatus}</p>
+            </div>
+          </fieldset>
         </article>
       </section>
     </div>

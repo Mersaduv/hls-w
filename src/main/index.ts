@@ -2,7 +2,8 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron"
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import type { AppSettings, IpcResult, PackagingJob, PackagingResult } from "@shared/types";
+import type { AppSettings, IpcResult, PackageUpdateJob, PackagingJob, PackagingResult, PackageUpdateResult } from "@shared/types";
+import { scanHlsPackage } from "@main/services/manifestParser";
 import { IPC_CHANNELS } from "@shared/ipc";
 import { probeVideo } from "@main/services/ffprobeService";
 import { resolveBinaryPaths } from "@main/services/ffmpegLocator";
@@ -123,6 +124,22 @@ function registerIpcHandlers(): void {
     return result.canceled ? null : result.filePaths[0];
   });
 
+  ipcMain.handle(IPC_CHANNELS.pickHlsPackageFolder, async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory"],
+    });
+    return result.canceled ? null : result.filePaths[0];
+  });
+
+  ipcMain.handle(IPC_CHANNELS.scanHlsPackage, async (_event, packageDir: string) => {
+    try {
+      const scanned = await scanHlsPackage(packageDir);
+      return ok(scanned);
+    } catch (error) {
+      return fail(error);
+    }
+  });
+
   ipcMain.handle(IPC_CHANNELS.settingsLoad, async () => {
     try {
       const data = await settingsStore.load();
@@ -228,6 +245,55 @@ function registerIpcHandlers(): void {
         percent: 0,
       });
       return fail<PackagingResult>(new Error(message));
+    } finally {
+      packagingRunning = false;
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.startPackageUpdate, async (_event, job: PackageUpdateJob) => {
+    if (packagingRunning) {
+      return fail<PackageUpdateResult>(new Error("A packaging task is already running."));
+    }
+
+    try {
+      packagingRunning = true;
+      const binaries = resolveBinaryPaths({
+        ffmpegPathOverride: job.ffmpegPathOverride,
+        ffprobePathOverride: job.ffprobePathOverride,
+      });
+
+      const result = await packager.updatePackage(job, binaries, {
+        onProgress: (progress) => sendProgress(IPC_CHANNELS.packagingProgress, progress),
+        onLog: (line) => sendProgress(IPC_CHANNELS.packagingLog, line),
+      });
+
+      return ok(result, binaries.warnings);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unexpected package update failure";
+      const canceled = /canceled/i.test(message);
+      if (canceled) {
+        const canceledResult: PackageUpdateResult = {
+          success: false,
+          canceled: true,
+          packageDir: job.packageDir,
+          addedSubtitles: [],
+          addedAudioTracks: [],
+          warnings: [],
+          error: "Package update canceled.",
+        };
+        sendProgress(IPC_CHANNELS.packagingProgress, {
+          step: "canceled",
+          message: "Package update canceled.",
+          percent: 0,
+        });
+        return ok(canceledResult);
+      }
+      sendProgress(IPC_CHANNELS.packagingProgress, {
+        step: "failed",
+        message,
+        percent: 0,
+      });
+      return fail<PackageUpdateResult>(new Error(message));
     } finally {
       packagingRunning = false;
     }

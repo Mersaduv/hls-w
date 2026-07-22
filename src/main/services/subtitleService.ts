@@ -34,13 +34,14 @@ function srtToVtt(input: string): string {
 
 export async function prepareSubtitles(
   subtitleTracks: SubtitleTrack[],
-  outputDir: string
+  outputDir: string,
+  existingLanguageCount?: Map<string, number>
 ): Promise<PreparedSubtitle[]> {
   const prepared: PreparedSubtitle[] = [];
   const subtitlesDir = path.join(outputDir, "subtitles");
   await fs.mkdir(subtitlesDir, { recursive: true });
 
-  const languageCount = new Map<string, number>();
+  const languageCount = new Map(existingLanguageCount ?? []);
 
   for (const subtitle of subtitleTracks) {
     const baseLang = toSafeLanguageCode(subtitle.language);

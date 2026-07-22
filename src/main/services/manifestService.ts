@@ -15,7 +15,7 @@ export interface MasterAudioTrack {
   language: string;
   type: AudioType;
   isDefault: boolean;
-  uri: string;
+  uri?: string;
 }
 
 export interface MasterSubtitleTrack {
@@ -29,15 +29,20 @@ interface MasterManifestInput {
   videoVariants: MasterVideoVariant[];
   audioTracks: MasterAudioTrack[];
   subtitles: MasterSubtitleTrack[];
+  audioGroupId?: string;
+  subtitleGroupId?: string;
 }
 
 export function buildMasterPlaylist(input: MasterManifestInput): string {
+  const audioGroupId = input.audioGroupId ?? "audio";
+  const subtitleGroupId = input.subtitleGroupId ?? "subs";
   const lines: string[] = ["#EXTM3U", "#EXT-X-VERSION:3", ""];
 
   for (const audio of input.audioTracks) {
     const defaultFlag = audio.isDefault ? "YES" : "NO";
+    const uriPart = audio.uri ? `,URI="${audio.uri}"` : "";
     lines.push(
-      `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${audio.name}",LANGUAGE="${audio.language}",AUTOSELECT=YES,DEFAULT=${defaultFlag},URI="${audio.uri}"`
+      `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="${audioGroupId}",NAME="${audio.name}",LANGUAGE="${audio.language}",AUTOSELECT=YES,DEFAULT=${defaultFlag}${uriPart}`
     );
   }
 
@@ -46,7 +51,7 @@ export function buildMasterPlaylist(input: MasterManifestInput): string {
     for (const subtitle of input.subtitles) {
       const defaultFlag = subtitle.isDefault ? "YES" : "NO";
       lines.push(
-        `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${subtitle.name}",LANGUAGE="${subtitle.language}",AUTOSELECT=YES,DEFAULT=${defaultFlag},FORCED=NO,URI="${subtitle.uri}"`
+        `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="${subtitleGroupId}",NAME="${subtitle.name}",LANGUAGE="${subtitle.language}",AUTOSELECT=YES,DEFAULT=${defaultFlag},FORCED=NO,URI="${subtitle.uri}"`
       );
     }
   }
@@ -54,9 +59,9 @@ export function buildMasterPlaylist(input: MasterManifestInput): string {
   lines.push("");
   for (const variant of input.videoVariants) {
     const bandwidth = variant.bitrateKbps * 1000;
-    const subtitlePart = input.subtitles.length > 0 ? `,SUBTITLES="subs"` : "";
+    const subtitlePart = input.subtitles.length > 0 ? `,SUBTITLES="${subtitleGroupId}"` : "";
     lines.push(
-      `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${variant.width}x${variant.height},CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"${subtitlePart}`
+      `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${variant.width}x${variant.height},CODECS="avc1.64001f,mp4a.40.2",AUDIO="${audioGroupId}"${subtitlePart}`
     );
     lines.push(variant.uri);
     lines.push("");
@@ -75,10 +80,50 @@ export async function writeMasterPlaylist(
   return masterPath;
 }
 
+export interface StoredMetadata {
+  hls_url?: string;
+  content_type?: ContentType;
+  movie_title?: string;
+  series?: {
+    title?: string;
+    season?: number;
+    episode?: number;
+    episode_title?: string;
+  };
+  has_dubbed?: boolean;
+  is_multi_audio?: boolean;
+  has_subtitle?: boolean;
+  qualities?: string[];
+  audio_tracks?: Array<{
+    name: string;
+    language: string;
+    type?: AudioType;
+    default?: boolean;
+    uri?: string;
+  }>;
+  subtitles?: Array<{
+    name: string;
+    language: string;
+    default?: boolean;
+    uri: string;
+  }>;
+}
+
+export async function readMetadataJson(packageDir: string): Promise<StoredMetadata | null> {
+  const metadataPath = path.join(packageDir, "metadata.json");
+  try {
+    const raw = await fs.readFile(metadataPath, "utf-8");
+    return JSON.parse(raw) as StoredMetadata;
+  } catch {
+    return null;
+  }
+}
+
 export async function writeMetadataJson(
   outputDir: string,
   payload: {
     contentType: ContentType;
+    movieTitle?: string;
     seriesTitle?: string;
     seasonNumber?: number;
     episodeNumber?: number;
@@ -92,6 +137,7 @@ export async function writeMetadataJson(
   const metadata = {
     hls_url: "master.m3u8",
     content_type: payload.contentType,
+    movie_title: isSeries ? undefined : payload.movieTitle,
     series: isSeries
       ? {
           title: payload.seriesTitle ?? "",

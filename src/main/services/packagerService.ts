@@ -9,6 +9,8 @@ import type {
   PackagingJob,
   PackagingProgress,
   PackagingResult,
+  PackageUpdateJob,
+  PackageUpdateResult,
   PerformanceMode,
   QualityPreset,
 } from "@shared/types";
@@ -23,6 +25,8 @@ import {
   writeMetadataJson,
 } from "@main/services/manifestService";
 import { prepareSubtitles } from "@main/services/subtitleService";
+import { runPackageUpdate } from "@main/services/packageUpdateService";
+import { scanHlsPackage } from "@main/services/manifestParser";
 import { HardwareEncoderDetector, type SelectedEncoder } from "@main/services/hardwareEncoderDetector";
 import { FFmpegCommandBuilder, type VideoOutputVariant } from "@main/services/ffmpegCommandBuilder";
 import { VideoPipelineBenchmarkService } from "@main/services/videoPipelineBenchmarkService";
@@ -145,6 +149,50 @@ export class HlsPackagerService {
     for (const child of Array.from(this.activeProcesses.values())) {
       this.killProcessTree(child);
     }
+  }
+
+  async scanPackage(packageDir: string) {
+    return scanHlsPackage(packageDir);
+  }
+
+  async updatePackage(
+    job: PackageUpdateJob,
+    binaries: BinaryPaths,
+    callbacks: PackageCallbacks
+  ): Promise<PackageUpdateResult> {
+    this.canceled = false;
+    try {
+      return await runPackageUpdate(this, job, binaries, callbacks);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof CanceledError || /canceled/i.test(message)) {
+        return {
+          success: false,
+          canceled: true,
+          packageDir: job.packageDir,
+          addedSubtitles: [],
+          addedAudioTracks: [],
+          warnings: [],
+          error: "Package update canceled.",
+        };
+      }
+      throw error;
+    }
+  }
+
+  runFfmpegPublic(input: {
+    binaryPath: string;
+    args: string[];
+    durationSeconds: number;
+    step: PackagingProgress["step"];
+    message: string;
+    startPercent: number;
+    endPercent: number;
+    onProgress: (progress: PackagingProgress) => void;
+    onLog: (line: string) => void;
+    onRatio?: (ratio: number) => void;
+  }): Promise<void> {
+    return this.runFfmpeg(input);
   }
 
   async package(job: PackagingJob, binaries: BinaryPaths, callbacks: PackageCallbacks): Promise<PackagingResult> {
@@ -303,7 +351,13 @@ export class HlsPackagerService {
     });
 
     await this.prepareVideoDirectories(runtimeJob.outputDir, enabledQualities);
-    await this.prepareVideoSources(runtimeJob.outputDir, runtimeJob.videoPath, videoInfo.height, onProgress);
+    await this.prepareVideoSources(
+      runtimeJob.outputDir,
+      runtimeJob.videoPath,
+      videoInfo.height,
+      this.resolveSourceFileBaseName(runtimeJob),
+      onProgress
+    );
     const audioPlans = await this.prepareAudioPlans(runtimeJob, audioTracks, binaries.ffprobePath);
 
     const videoVariants: MasterVideoVariant[] = [];
@@ -607,6 +661,7 @@ export class HlsPackagerService {
 
     const metadataPath = await writeMetadataJson(runtimeJob.outputDir, {
       contentType: this.resolveContentType(runtimeJob.contentType),
+      movieTitle: runtimeJob.movieTitle,
       seriesTitle: runtimeJob.seriesTitle,
       seasonNumber: runtimeJob.seasonNumber,
       episodeNumber: runtimeJob.episodeNumber,
@@ -696,6 +751,7 @@ export class HlsPackagerService {
         segmentDuration: effectiveSegmentDuration,
         audioCodec: plan.sourceCodec ?? undefined,
         audioMode: job.audioMode,
+        audioOffsetMs: plan.track.audioOffsetMs,
       });
 
       await this.runFfmpeg({
@@ -736,6 +792,7 @@ export class HlsPackagerService {
     outputDir: string,
     inputVideoPath: string,
     sourceHeight: number,
+    sourceFileBaseName: string,
     onProgress: (progress: PackagingProgress) => void
   ): Promise<void> {
     const selectedBucket = chooseSourceBucket(sourceHeight);
@@ -744,7 +801,7 @@ export class HlsPackagerService {
     await fs.mkdir(srcDir, { recursive: true });
 
     const parsed = path.parse(inputVideoPath);
-    const base = safeFileBaseName(parsed.name);
+    const base = safeFileBaseName(sourceFileBaseName);
     const ext = parsed.ext || ".mp4";
 
     let destPath = path.join(srcDir, `${base}${ext}`);
@@ -850,6 +907,8 @@ export class HlsPackagerService {
       if (!Number.isFinite(job.episodeNumber) || (job.episodeNumber ?? 0) < 1) {
         throw new Error("Episode number must be at least 1 for series processing.");
       }
+    } else if (!job.movieTitle?.trim()) {
+      throw new Error("Movie title is required.");
     }
 
     const defaultCount = audioTracks.filter((track) => track.isDefault).length;
@@ -1005,6 +1064,13 @@ export class HlsPackagerService {
     return `${year}-${month}-${day}`;
   }
 
+  private resolveSourceFileBaseName(job: PackagingJob): string {
+    if (this.resolveContentType(job.contentType) === "series") {
+      return sanitizeFolderName((job.seriesTitle ?? "").trim());
+    }
+    return sanitizeFolderName((job.movieTitle ?? "").trim());
+  }
+
   private resolveContentType(value?: ContentType): ContentType {
     return value === "series" ? "series" : "movie";
   }
@@ -1035,8 +1101,10 @@ export class HlsPackagerService {
     await fs.mkdir(resolvedBase, { recursive: true });
 
     const movieTitle = sanitizeFolderName((job.movieTitle ?? "").trim());
-    const movieBaseName =
-      movieTitle || sanitizeFolderName(path.basename(videoPath, path.extname(videoPath)) || "movie");
+    if (!movieTitle || movieTitle === "track") {
+      throw new Error("Movie title is required.");
+    }
+    const movieBaseName = movieTitle;
     const dateFolder = this.formatDateFolder(new Date());
     const datedRoot = path.join(resolvedBase, dateFolder);
     await fs.mkdir(datedRoot, { recursive: true });
