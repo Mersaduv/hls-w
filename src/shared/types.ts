@@ -170,6 +170,7 @@ export interface AppSettings {
   recentVideoPath?: string;
   recentOutputDir?: string;
   recentContentType?: ContentType;
+  recentMovieTitle?: string;
   recentSeriesTitle?: string;
   recentSeasonNumber?: number;
   recentEpisodeNumber?: number;

@@ -693,7 +693,7 @@ export class HlsPackagerService {
         language: track.language,
         type: track.type,
         isDefault: track.isDefault,
-        uri: track.uri,
+        uri: track.uri ?? "",
       })),
       subtitles: masterSubtitles.map((subtitle) => ({
         name: subtitle.name,

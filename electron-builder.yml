@@ -1,5 +1,6 @@
-appId: com.media.hlspackager
-productName: HLS Media Packager
+appId: com.mersadkarimi.hlspackager
+productName: HLS Packager
+copyright: Copyright © 2026 Mersad Karimi
 directories:
   output: release
   buildResources: build
@@ -18,12 +19,13 @@ win:
     - target: nsis
       arch:
         - x64
-  executableName: HLS-Media-Packager
+  executableName: HLS-Packager
+  publisherName: Mersad Karimi
 nsis:
   artifactName: "${productName}-${version}-setup.${ext}"
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: always
   createStartMenuShortcut: true
-  shortcutName: HLS Media Packager
+  shortcutName: HLS Packager
 npmRebuild: false

@@ -15,7 +15,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   encoderPreference: "auto",
   audioMode: "copy-when-possible",
   parallelAudioProcessing: true,
-  theme: "light"
+  theme: "dark"
 };
 
 export const QUALITY_BUNDLES = {

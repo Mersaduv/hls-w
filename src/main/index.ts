@@ -5,6 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import type { AppSettings, IpcResult, PackageUpdateJob, PackagingJob, PackagingResult, PackageUpdateResult } from "@shared/types";
 import { scanHlsPackage } from "@main/services/manifestParser";
 import { IPC_CHANNELS } from "@shared/ipc";
+import { APP_NAME } from "@shared/appMeta";
 import { probeVideo } from "@main/services/ffprobeService";
 import { resolveBinaryPaths } from "@main/services/ffmpegLocator";
 import { SettingsStore } from "@main/services/configStore";
@@ -35,17 +36,23 @@ function sendProgress(channel: string, payload: unknown): void {
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 920,
-    minWidth: 1120,
-    minHeight: 760,
-    backgroundColor: "#f5f8ff",
+    width: 1520,
+    height: 960,
+    minWidth: 1280,
+    minHeight: 800,
+    title: APP_NAME,
+    backgroundColor: "#0e0e10",
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
     },
+  });
+
+  mainWindow.once("ready-to-show", () => {
+    mainWindow?.show();
   });
 
   if (process.env.ELECTRON_RENDERER_URL) {

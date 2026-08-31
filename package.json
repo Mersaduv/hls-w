@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Windows desktop app for creating HLS VOD packages from local media files.",
   "main": "dist/main/index.js",
-  "author": "Media Team",
+  "author": "Mersad Karimi",
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",
